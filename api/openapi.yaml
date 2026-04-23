@@ -1,0 +1,1963 @@
+openapi: 3.1.0
+info:
+  contact:
+    name: Liqhtworks
+    url: https://liqhtworks.xyz
+  description: |
+    REST API for submitting, monitoring, and retrieving SOPHON encoding jobs.
+
+    Authentication is via Bearer API key or session cookie. All POST endpoints
+    require an Idempotency-Key header. List endpoints use opaque cursor-based
+    pagination.
+  title: SOPHON Encoding API
+  version: 1.0.0
+servers:
+- description: Production
+  url: https://api.liqhtworks.xyz
+security:
+- bearerApiKey: []
+- sessionCookie: []
+tags:
+- description: "Submit, inspect, cancel, and retrieve encoding jobs."
+  name: Jobs
+- description: Create chunked uploads and assemble source media.
+  name: Uploads
+- description: Manage outbound terminal-job webhook endpoints.
+  name: Webhooks
+- description: Outbound webhook payloads delivered by SOPHON.
+  name: Webhook Events
+- description: Resolve signed output download tokens.
+  name: Downloads
+- description: "Service health, readiness, version, and metrics endpoints."
+  name: Health
+paths:
+  /v1/jobs:
+    get:
+      description: |
+        Returns jobs for the authenticated organization ordered by creation
+        time, with optional status filtering and opaque cursor pagination.
+      operationId: listJobs
+      parameters:
+      - description: Filter by job status.
+        explode: true
+        in: query
+        name: status
+        required: false
+        schema:
+          $ref: "#/components/schemas/JobStatus"
+        style: form
+      - $ref: "#/components/parameters/LimitParam"
+      - $ref: "#/components/parameters/CursorParam"
+      responses:
+        "200":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ListJobsResponse"
+          description: "Paginated list of jobs, ordered by created_at descending."
+          headers:
+            X-Request-Id:
+              $ref: "#/components/headers/XRequestId"
+        "400":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorEnvelope"
+          description: Invalid status filter or cursor.
+          headers:
+            X-Request-Id:
+              $ref: "#/components/headers/XRequestId"
+        "401":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorEnvelope"
+          description: Missing or invalid credentials.
+          headers:
+            X-Request-Id:
+              $ref: "#/components/headers/XRequestId"
+        "403":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorEnvelope"
+          description: Insufficient scope (requires jobs:read).
+          headers:
+            X-Request-Id:
+              $ref: "#/components/headers/XRequestId"
+      security:
+      - bearerApiKey: []
+      - sessionCookie: []
+      summary: List jobs with cursor pagination
+      tags:
+      - Jobs
+    post:
+      description: |
+        Creates a queued encoding job from a completed upload source. The
+        `profile` field accepts explicit coffee profiles or `sophon-auto`,
+        and `output.target_height` can request aspect-preserving downscale.
+      operationId: createJob
+      parameters:
+      - $ref: "#/components/parameters/IdempotencyKey"
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/CreateJobRequest"
+        required: true
+      responses:
+        "201":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/JobResponse"
+          description: Job created.
+          headers:
+            X-Request-Id:
+              $ref: "#/components/headers/XRequestId"
+        "400":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorEnvelope"
+          description: "Validation error (bad profile, source, container, metadata,\
+            \ or webhook_ids)."
+          headers:
+            X-Request-Id:
+              $ref: "#/components/headers/XRequestId"
+        "401":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorEnvelope"
+          description: Missing or invalid credentials.
+          headers:
+            X-Request-Id:
+              $ref: "#/components/headers/XRequestId"
+        "403":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorEnvelope"
+          description: Insufficient scope (requires jobs:create).
+          headers:
+            X-Request-Id:
+              $ref: "#/components/headers/XRequestId"
+        "409":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorEnvelope"
+          description: "Idempotency conflict (same key, different request body)."
+          headers:
+            X-Request-Id:
+              $ref: "#/components/headers/XRequestId"
+        "422":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorEnvelope"
+          description: Source is invalid or unsupported.
+          headers:
+            X-Request-Id:
+              $ref: "#/components/headers/XRequestId"
+        "429":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorEnvelope"
+          description: Rate limited or quota exceeded.
+          headers:
+            X-Request-Id:
+              $ref: "#/components/headers/XRequestId"
+      security:
+      - bearerApiKey: []
+      - sessionCookie: []
+      summary: Submit an encoding job
+      tags:
+      - Jobs
+  /v1/jobs/{id}:
+    delete:
+      description: |
+        Cancels a job in a non-terminal state (queued, probing, encoding, muxing,
+        uploading_output). Returns 409 if the job is already completed, failed, or canceled.
+      operationId: cancelJob
+      parameters:
+      - explode: false
+        in: path
+        name: id
+        required: true
+        schema:
+          type: string
+        style: simple
+      responses:
+        "200":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/JobResponse"
+          description: Job canceled. Returns the updated job.
+          headers:
+            X-Request-Id:
+              $ref: "#/components/headers/XRequestId"
+        "401":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorEnvelope"
+          description: Missing or invalid credentials.
+          headers:
+            X-Request-Id:
+              $ref: "#/components/headers/XRequestId"
+        "403":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorEnvelope"
+          description: Insufficient scope (requires jobs:cancel).
+          headers:
+            X-Request-Id:
+              $ref: "#/components/headers/XRequestId"
+        "404":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorEnvelope"
+          description: Job not found.
+          headers:
+            X-Request-Id:
+              $ref: "#/components/headers/XRequestId"
+        "409":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorEnvelope"
+          description: Job is in a terminal state and cannot be canceled (job_not_cancelable).
+          headers:
+            X-Request-Id:
+              $ref: "#/components/headers/XRequestId"
+      security:
+      - bearerApiKey: []
+      - sessionCookie: []
+      summary: Cancel a job
+      tags:
+      - Jobs
+    get:
+      description: |
+        Returns current job state, progress, source metadata, resolved adaptive
+        profile information, and output availability for one job.
+      operationId: getJob
+      parameters:
+      - explode: false
+        in: path
+        name: id
+        required: true
+        schema:
+          type: string
+        style: simple
+      responses:
+        "200":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/JobResponse"
+          description: Job details.
+          headers:
+            X-Request-Id:
+              $ref: "#/components/headers/XRequestId"
+        "401":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorEnvelope"
+          description: Missing or invalid credentials.
+          headers:
+            X-Request-Id:
+              $ref: "#/components/headers/XRequestId"
+        "403":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorEnvelope"
+          description: Insufficient scope (requires jobs:read).
+          headers:
+            X-Request-Id:
+              $ref: "#/components/headers/XRequestId"
+        "404":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorEnvelope"
+          description: Job not found.
+          headers:
+            X-Request-Id:
+              $ref: "#/components/headers/XRequestId"
+      security:
+      - bearerApiKey: []
+      - sessionCookie: []
+      summary: Get a single job by ID
+      tags:
+      - Jobs
+  /v1/jobs/{id}/output:
+    get:
+      description: |
+        Returns a 302 redirect to a signed download URL for the job's output file.
+        The signed URL is valid for 24 hours.
+      operationId: getJobOutput
+      parameters:
+      - explode: false
+        in: path
+        name: id
+        required: true
+        schema:
+          type: string
+        style: simple
+      responses:
+        "302":
+          description: |
+            Redirect to signed download URL. The resolved resource is a video/mp4 file.
+          headers:
+            Location:
+              description: Signed download URL (24-hour TTL). Resolves to video/mp4.
+              explode: false
+              schema:
+                format: uri
+                type: string
+              style: simple
+            X-Request-Id:
+              $ref: "#/components/headers/XRequestId"
+        "401":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorEnvelope"
+          description: Missing or invalid credentials.
+          headers:
+            X-Request-Id:
+              $ref: "#/components/headers/XRequestId"
+        "403":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorEnvelope"
+          description: Insufficient scope (requires outputs:read).
+          headers:
+            X-Request-Id:
+              $ref: "#/components/headers/XRequestId"
+        "404":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorEnvelope"
+          description: Job not found.
+          headers:
+            X-Request-Id:
+              $ref: "#/components/headers/XRequestId"
+        "409":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorEnvelope"
+          description: Output not ready (job not in completed state).
+          headers:
+            X-Request-Id:
+              $ref: "#/components/headers/XRequestId"
+      security:
+      - bearerApiKey: []
+      - sessionCookie: []
+      summary: Get the encoded output file
+      tags:
+      - Jobs
+  /v1/uploads:
+    post:
+      description: |
+        Starts a resumable source upload and returns the chunk size, chunk
+        count, session ID, and expiration timestamp.
+      operationId: createUpload
+      parameters:
+      - $ref: "#/components/parameters/IdempotencyKey"
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/CreateUploadRequest"
+        required: true
+      responses:
+        "201":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/CreateUploadResponse"
+          description: Upload session created.
+          headers:
+            X-Request-Id:
+              $ref: "#/components/headers/XRequestId"
+        "400":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorEnvelope"
+          description: "Validation error (empty file_name, zero file_size, exceeds\
+            \ max)."
+          headers:
+            X-Request-Id:
+              $ref: "#/components/headers/XRequestId"
+        "401":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorEnvelope"
+          description: Missing or invalid credentials.
+          headers:
+            X-Request-Id:
+              $ref: "#/components/headers/XRequestId"
+        "403":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorEnvelope"
+          description: Insufficient scope (requires uploads:create).
+          headers:
+            X-Request-Id:
+              $ref: "#/components/headers/XRequestId"
+        "409":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorEnvelope"
+          description: Idempotency conflict.
+          headers:
+            X-Request-Id:
+              $ref: "#/components/headers/XRequestId"
+        "429":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorEnvelope"
+          description: Rate limited or quota exceeded.
+          headers:
+            X-Request-Id:
+              $ref: "#/components/headers/XRequestId"
+        "503":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorEnvelope"
+          description: Disk capacity exceeded; uploads paused.
+          headers:
+            X-Request-Id:
+              $ref: "#/components/headers/XRequestId"
+      security:
+      - bearerApiKey: []
+      - sessionCookie: []
+      summary: Initialize a chunked upload session
+      tags:
+      - Uploads
+  /v1/uploads/{id}:
+    delete:
+      description: |
+        Sets the upload session to canceled and deletes staged chunks from disk.
+      operationId: cancelUpload
+      parameters:
+      - explode: false
+        in: path
+        name: id
+        required: true
+        schema:
+          type: string
+        style: simple
+      responses:
+        "204":
+          description: Upload canceled. No content returned.
+          headers:
+            X-Request-Id:
+              $ref: "#/components/headers/XRequestId"
+        "401":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorEnvelope"
+          description: Missing or invalid credentials.
+          headers:
+            X-Request-Id:
+              $ref: "#/components/headers/XRequestId"
+        "403":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorEnvelope"
+          description: Insufficient scope (requires uploads:write).
+          headers:
+            X-Request-Id:
+              $ref: "#/components/headers/XRequestId"
+        "404":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorEnvelope"
+          description: Upload session not found.
+          headers:
+            X-Request-Id:
+              $ref: "#/components/headers/XRequestId"
+      security:
+      - bearerApiKey: []
+      - sessionCookie: []
+      summary: Cancel an upload session
+      tags:
+      - Uploads
+    get:
+      description: |
+        Returns received chunks and, after assembly/probe, source dimensions
+        and duration used by downstream budget and encoding decisions.
+      operationId: getUpload
+      parameters:
+      - explode: false
+        in: path
+        name: id
+        required: true
+        schema:
+          type: string
+        style: simple
+      responses:
+        "200":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/UploadStatusResponse"
+          description: Upload session status.
+          headers:
+            X-Request-Id:
+              $ref: "#/components/headers/XRequestId"
+        "401":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorEnvelope"
+          description: Missing or invalid credentials.
+          headers:
+            X-Request-Id:
+              $ref: "#/components/headers/XRequestId"
+        "403":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorEnvelope"
+          description: Insufficient scope (requires uploads:read).
+          headers:
+            X-Request-Id:
+              $ref: "#/components/headers/XRequestId"
+        "404":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorEnvelope"
+          description: Upload session not found.
+          headers:
+            X-Request-Id:
+              $ref: "#/components/headers/XRequestId"
+      security:
+      - bearerApiKey: []
+      - sessionCookie: []
+      summary: Get upload session status
+      tags:
+      - Uploads
+  /v1/uploads/{id}/parts/{part_number}:
+    put:
+      description: |
+        Streams the chunk body to disk. Part numbers are 0-indexed.
+        Uploading the same part number again is idempotent (returns success without re-writing).
+      operationId: uploadPart
+      parameters:
+      - explode: false
+        in: path
+        name: id
+        required: true
+        schema:
+          type: string
+        style: simple
+      - explode: false
+        in: path
+        name: part_number
+        required: true
+        schema:
+          minimum: 0
+          type: integer
+        style: simple
+      requestBody:
+        content:
+          application/octet-stream:
+            schema:
+              format: binary
+              type: string
+        required: true
+      responses:
+        "200":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/UploadPartResponse"
+          description: Chunk received.
+          headers:
+            X-Request-Id:
+              $ref: "#/components/headers/XRequestId"
+        "400":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorEnvelope"
+          description: Part number out of range.
+          headers:
+            X-Request-Id:
+              $ref: "#/components/headers/XRequestId"
+        "401":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorEnvelope"
+          description: Missing or invalid credentials.
+          headers:
+            X-Request-Id:
+              $ref: "#/components/headers/XRequestId"
+        "403":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorEnvelope"
+          description: Insufficient scope (requires uploads:write).
+          headers:
+            X-Request-Id:
+              $ref: "#/components/headers/XRequestId"
+        "404":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorEnvelope"
+          description: Upload session not found.
+          headers:
+            X-Request-Id:
+              $ref: "#/components/headers/XRequestId"
+        "409":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorEnvelope"
+          description: Upload session is not in "uploading" state.
+          headers:
+            X-Request-Id:
+              $ref: "#/components/headers/XRequestId"
+        "503":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorEnvelope"
+          description: Disk capacity exceeded.
+          headers:
+            X-Request-Id:
+              $ref: "#/components/headers/XRequestId"
+      security:
+      - bearerApiKey: []
+      - sessionCookie: []
+      summary: Upload a single chunk
+      tags:
+      - Uploads
+  /v1/uploads/{id}/complete:
+    post:
+      description: |
+        Assembles all received chunks into a single file, validates size matches
+        the declared file_size, probes with ffprobe, and transitions the session to completed.
+      operationId: completeUpload
+      parameters:
+      - explode: false
+        in: path
+        name: id
+        required: true
+        schema:
+          type: string
+        style: simple
+      - $ref: "#/components/parameters/IdempotencyKey"
+      responses:
+        "200":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/CompleteUploadResponse"
+          description: Upload assembled and validated.
+          headers:
+            X-Request-Id:
+              $ref: "#/components/headers/XRequestId"
+        "400":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorEnvelope"
+          description: Not all chunks received.
+          headers:
+            X-Request-Id:
+              $ref: "#/components/headers/XRequestId"
+        "401":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorEnvelope"
+          description: Missing or invalid credentials.
+          headers:
+            X-Request-Id:
+              $ref: "#/components/headers/XRequestId"
+        "403":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorEnvelope"
+          description: Insufficient scope (requires uploads:write).
+          headers:
+            X-Request-Id:
+              $ref: "#/components/headers/XRequestId"
+        "404":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorEnvelope"
+          description: Upload session not found.
+          headers:
+            X-Request-Id:
+              $ref: "#/components/headers/XRequestId"
+        "409":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorEnvelope"
+          description: Upload session is not in "uploading" state.
+          headers:
+            X-Request-Id:
+              $ref: "#/components/headers/XRequestId"
+        "422":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorEnvelope"
+          description: Assembled file size mismatch or not a valid video file (source_invalid).
+          headers:
+            X-Request-Id:
+              $ref: "#/components/headers/XRequestId"
+        "503":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorEnvelope"
+          description: Disk capacity exceeded; cannot assemble.
+          headers:
+            X-Request-Id:
+              $ref: "#/components/headers/XRequestId"
+      security:
+      - bearerApiKey: []
+      - sessionCookie: []
+      summary: Finalize a chunked upload
+      tags:
+      - Uploads
+  /v1/webhooks:
+    get:
+      description: |
+        Lists active webhook endpoints for the authenticated organization.
+      operationId: listWebhooks
+      responses:
+        "200":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/WebhookListResponse"
+          description: List of active webhooks for the authenticated organization.
+          headers:
+            X-Request-Id:
+              $ref: "#/components/headers/XRequestId"
+        "401":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorEnvelope"
+          description: Missing or invalid credentials.
+          headers:
+            X-Request-Id:
+              $ref: "#/components/headers/XRequestId"
+        "403":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorEnvelope"
+          description: Insufficient scope (requires webhooks:manage).
+          headers:
+            X-Request-Id:
+              $ref: "#/components/headers/XRequestId"
+      security:
+      - bearerApiKey: []
+      - sessionCookie: []
+      summary: List active webhook endpoints
+      tags:
+      - Webhooks
+    post:
+      description: |
+        Registers an HTTPS endpoint for terminal job events and returns the
+        HMAC signing secret once at creation time.
+      operationId: createWebhook
+      parameters:
+      - $ref: "#/components/parameters/IdempotencyKey"
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/CreateWebhookRequest"
+        required: true
+      responses:
+        "201":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/WebhookResponse"
+          description: Webhook registered. The response includes the HMAC secret (shown
+            only once).
+          headers:
+            X-Request-Id:
+              $ref: "#/components/headers/XRequestId"
+        "400":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorEnvelope"
+          description: "Invalid URL (non-HTTPS, private IP, userinfo, etc.)."
+          headers:
+            X-Request-Id:
+              $ref: "#/components/headers/XRequestId"
+        "401":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorEnvelope"
+          description: Missing or invalid credentials.
+          headers:
+            X-Request-Id:
+              $ref: "#/components/headers/XRequestId"
+        "403":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorEnvelope"
+          description: Insufficient scope (requires webhooks:manage).
+          headers:
+            X-Request-Id:
+              $ref: "#/components/headers/XRequestId"
+        "409":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorEnvelope"
+          description: Idempotency conflict.
+          headers:
+            X-Request-Id:
+              $ref: "#/components/headers/XRequestId"
+        "429":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorEnvelope"
+          description: Rate limited.
+          headers:
+            X-Request-Id:
+              $ref: "#/components/headers/XRequestId"
+      security:
+      - bearerApiKey: []
+      - sessionCookie: []
+      summary: Register a webhook endpoint
+      tags:
+      - Webhooks
+  /v1/webhooks/{id}:
+    delete:
+      description: Sets the webhook to inactive. It will no longer receive deliveries.
+      operationId: deleteWebhook
+      parameters:
+      - explode: false
+        in: path
+        name: id
+        required: true
+        schema:
+          type: string
+        style: simple
+      responses:
+        "204":
+          description: Webhook deactivated. No content returned.
+          headers:
+            X-Request-Id:
+              $ref: "#/components/headers/XRequestId"
+        "401":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorEnvelope"
+          description: Missing or invalid credentials.
+          headers:
+            X-Request-Id:
+              $ref: "#/components/headers/XRequestId"
+        "403":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorEnvelope"
+          description: Insufficient scope (requires webhooks:manage).
+          headers:
+            X-Request-Id:
+              $ref: "#/components/headers/XRequestId"
+        "404":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorEnvelope"
+          description: Webhook not found or already inactive.
+          headers:
+            X-Request-Id:
+              $ref: "#/components/headers/XRequestId"
+      security:
+      - bearerApiKey: []
+      - sessionCookie: []
+      summary: Soft-delete a webhook endpoint
+      tags:
+      - Webhooks
+  /v1/downloads/{token}:
+    get:
+      description: |
+        Serves the encoded output file. No Authorization header required -- the
+        HMAC-signed token (generated by GET /v1/jobs/{id}/output) IS the credential.
+        Tokens expire after 24 hours.
+      operationId: download
+      parameters:
+      - description: HMAC-signed download token encoding the object key and expiry.
+        explode: false
+        in: path
+        name: token
+        required: true
+        schema:
+          type: string
+        style: simple
+      responses:
+        "200":
+          content:
+            video/mp4:
+              schema:
+                format: binary
+                type: string
+          description: File stream.
+          headers:
+            Content-Disposition:
+              description: attachment; filename="<output-filename>"
+              explode: false
+              schema:
+                type: string
+              style: simple
+            Content-Type:
+              description: video/mp4
+              explode: false
+              schema:
+                type: string
+              style: simple
+            Content-Length:
+              explode: false
+              schema:
+                format: int64
+                type: integer
+              style: simple
+            X-Request-Id:
+              $ref: "#/components/headers/XRequestId"
+        "403":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorEnvelope"
+          description: Invalid or expired download token.
+          headers:
+            X-Request-Id:
+              $ref: "#/components/headers/XRequestId"
+        "404":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorEnvelope"
+          description: Output file not found on disk.
+          headers:
+            X-Request-Id:
+              $ref: "#/components/headers/XRequestId"
+      security: []
+      summary: Download an output file via signed token
+      tags:
+      - Downloads
+  /healthz:
+    get:
+      description: Always returns 200. Used by load balancers and orchestrators.
+      operationId: healthz
+      responses:
+        "200":
+          description: Service is alive.
+          headers:
+            X-Request-Id:
+              $ref: "#/components/headers/XRequestId"
+      security: []
+      summary: Liveness probe
+      tags:
+      - Health
+  /readyz:
+    get:
+      description: |
+        Returns 200 when the service is ready to accept traffic. Checks database
+        connectivity, disk headroom (warning and critical thresholds), worker liveness,
+        and drain state.
+      operationId: readyz
+      responses:
+        "200":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ReadyResponse"
+          description: All readiness checks passed.
+          headers:
+            X-Request-Id:
+              $ref: "#/components/headers/XRequestId"
+        "503":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ReadyResponse"
+          description: One or more readiness checks failed.
+          headers:
+            X-Request-Id:
+              $ref: "#/components/headers/XRequestId"
+      security: []
+      summary: Readiness probe
+      tags:
+      - Health
+  /metrics:
+    get:
+      description: |
+        Returns metrics in Prometheus text exposition format.
+        This endpoint is operator-only and is not part of the public customer API.
+        It should be firewalled from external traffic and scraped only by internal
+        Prometheus infrastructure.
+      operationId: metrics
+      responses:
+        "200":
+          content:
+            text/plain:
+              schema:
+                type: string
+          description: Prometheus metrics.
+      security: []
+      summary: Prometheus metrics (operator-only)
+      tags:
+      - Health
+      x-internal: true
+components:
+  headers:
+    XRequestId:
+      description: Unique ID for this request. Use in support tickets.
+      explode: false
+      schema:
+        type: string
+      style: simple
+  parameters:
+    IdempotencyKey:
+      description: |
+        Client-generated UUID or string for exactly-once semantics.
+        Required on all POST endpoints. Replaying the same key with the
+        same request body returns the original response without side effects.
+      explode: false
+      in: header
+      name: Idempotency-Key
+      required: true
+      schema:
+        maxLength: 128
+        minLength: 1
+        type: string
+      style: simple
+    CursorParam:
+      description: Opaque pagination cursor returned in a previous response's `next_cursor`
+        field.
+      explode: true
+      in: query
+      name: cursor
+      required: false
+      schema:
+        type: string
+      style: form
+    LimitParam:
+      description: Maximum number of items to return per page.
+      explode: true
+      in: query
+      name: limit
+      required: false
+      schema:
+        default: 20
+        maximum: 100
+        minimum: 1
+        type: integer
+      style: form
+  schemas:
+    ErrorEnvelope:
+      example:
+        error:
+          retryable: true
+          code: validation_error
+          message: message
+          request_id: request_id
+      properties:
+        error:
+          $ref: "#/components/schemas/ErrorBody"
+      required:
+      - error
+    ErrorBody:
+      example:
+        retryable: true
+        code: validation_error
+        message: message
+        request_id: request_id
+      properties:
+        code:
+          enum:
+          - validation_error
+          - unauthorized
+          - forbidden
+          - not_found
+          - conflict
+          - rate_limited
+          - quota_exceeded
+          - capacity_exceeded
+          - source_invalid
+          - source_unsupported
+          - job_not_cancelable
+          - output_not_ready
+          - output_persistence_failed
+          - internal_error
+          type: string
+        message:
+          type: string
+        retryable:
+          description: |
+            True for rate_limited, capacity_exceeded, and internal_error.
+            Clients should retry with exponential backoff when true.
+          type: boolean
+        request_id:
+          description: Server-assigned request ID for correlation with logs.
+          type: string
+          nullable: true
+      required:
+      - code
+      - message
+      - retryable
+    JobMetadata:
+      additionalProperties: true
+      description: |
+        Arbitrary JSON object attached to a job. Keys and values are passed
+        through unchanged to webhook deliveries and echoed on job reads. The
+        serialized representation must not exceed 16 KiB. Free-form; SDKs
+        surface this as a `Record<string, unknown>` / `dict[str, Any]` /
+        `map[string]interface{}` depending on language.
+      type: object
+    WebhookDeliveryPayload:
+      description: |
+        Payload delivered to registered webhook endpoints on terminal job events.
+        Signed with HMAC-SHA256 over `"{timestamp}.{raw_body}"` using the
+        per-webhook secret. Consumers must verify the signature before processing.
+      example:
+        metadata: ""
+        event_id: evt_01JQabc123
+        job_id: job_01JQ8C4K4W6YQ7M4M0A5K9T6RF
+        type: job.completed
+        timestamp: 2000-01-23T04:56:07.000+00:00
+        status: completed
+      properties:
+        event_id:
+          description: Unique delivery event ID for deduplication.
+          example: evt_01JQabc123
+          type: string
+        type:
+          description: Event type.
+          enum:
+          - job.completed
+          - job.failed
+          - job.canceled
+          type: string
+        timestamp:
+          description: ISO 8601 timestamp of the event.
+          format: date-time
+          type: string
+        job_id:
+          description: The job that reached a terminal state.
+          example: job_01JQ8C4K4W6YQ7M4M0A5K9T6RF
+          type: string
+        status:
+          description: Terminal job status.
+          enum:
+          - completed
+          - failed
+          - canceled
+          type: string
+        metadata:
+          allOf:
+          - $ref: "#/components/schemas/JobMetadata"
+          description: Opaque metadata from the original job submission.
+      required:
+      - event_id
+      - job_id
+      - metadata
+      - status
+      - timestamp
+      - type
+    JobProfile:
+      description: |
+        Encoding profile ID. Coffee-themed naming: prep time maps to encode speed,
+        bare name is the 8-bit default (universal decoder compatibility),
+        `-10bit` suffix opts into HEVC Main10 for higher-quality playback on
+        newer decoders.
+
+        **8-bit (default):**
+        - `sophon-espresso` — fastest, lowest compression
+        - `sophon-cortado` — balanced speed and quality
+        - `sophon-americano` — slowest, highest compression
+
+        **10-bit (HEVC Main10):**
+        - `sophon-espresso-10bit`
+        - `sophon-cortado-10bit`
+        - `sophon-americano-10bit`
+
+        **Adaptive dispatcher:**
+        - `sophon-auto` — public opt-in profile. The worker classifies
+          the source and records the concrete `effective_profile_id` on
+          the job once dispatch resolves.
+      enum:
+      - sophon-espresso
+      - sophon-cortado
+      - sophon-americano
+      - sophon-espresso-10bit
+      - sophon-cortado-10bit
+      - sophon-americano-10bit
+      - sophon-auto
+      example: sophon-auto
+      type: string
+    JobSourceType:
+      description: Discriminator for `JobSource` variants.
+      enum:
+      - upload
+      type: string
+    UploadJobSource:
+      description: Source backed by a completed chunked upload session.
+      example:
+        upload_id: upl_01JQ8abc123
+        type: upload
+      properties:
+        type:
+          $ref: "#/components/schemas/JobSourceType"
+        upload_id:
+          description: ID of a completed upload session.
+          example: upl_01JQ8abc123
+          type: string
+      required:
+      - type
+      - upload_id
+    JobSource:
+      $ref: "#/components/schemas/UploadJobSource"
+    OutputContainer:
+      default: mp4
+      description: |
+        Output container format. MP4 is widely compatible; MKV
+        supports a broader range of audio codecs for passthrough.
+      enum:
+      - mp4
+      - mkv
+      type: string
+    CreateJobOutputOptions:
+      description: Optional output shaping knobs for a new job.
+      example:
+        container: mp4
+        target_height: 1080
+        audio: false
+      properties:
+        container:
+          $ref: "#/components/schemas/OutputContainer"
+        audio:
+          default: false
+          description: |
+            When true, audio is included in the output. MKV preserves
+            source audio streams unchanged. MP4 preserves broadly compatible
+            source audio codecs when possible, and may normalize
+            incompatible codecs to AAC for playback compatibility.
+            When false, the output is video only.
+          type: boolean
+        target_height:
+          description: |
+            Target output height in pixels. When set, output is scaled down
+            (aspect ratio preserved, width derived from source, both dims
+            rounded to even). If absent or larger than source height, output
+            uses source dimensions. Billing tier is determined by the actual
+            encoded output, not by this requested value.
+          example: 1080
+          maximum: 4320
+          minimum: 144
+          type: integer
+          nullable: true
+    CreateJobRequest:
+      example:
+        output:
+          container: mp4
+          target_height: 1080
+          audio: false
+        metadata: ""
+        webhook_ids:
+        - webhook_ids
+        - webhook_ids
+        profile: sophon-auto
+        source:
+          upload_id: upl_01JQ8abc123
+          type: upload
+      properties:
+        source:
+          $ref: "#/components/schemas/UploadJobSource"
+        profile:
+          $ref: "#/components/schemas/JobProfile"
+        output:
+          $ref: "#/components/schemas/CreateJobOutputOptions"
+        webhook_ids:
+          default: []
+          description: IDs of registered webhook endpoints to notify on job state
+            changes.
+          items:
+            type: string
+          type: array
+        metadata:
+          allOf:
+          - $ref: "#/components/schemas/JobMetadata"
+          default: {}
+          description: Arbitrary key-value metadata attached to the job. Max 16 KiB
+            serialized.
+      required:
+      - profile
+      - source
+    JobStatus:
+      description: Lifecycle status for an encoding job.
+      enum:
+      - queued
+      - probing
+      - encoding
+      - muxing
+      - uploading_output
+      - completed
+      - failed
+      - canceled
+      type: string
+    JobResponse:
+      example:
+        retryable: true
+        metadata:
+          key: ""
+        profile: ""
+        effective_profile_id: effective_profile_id
+        created_at: 2000-01-23T04:56:07.000+00:00
+        source:
+          duration_seconds: 1.4658129805029452
+          sha256: sha256
+          bytes: 6
+          name: name
+          resolution: 1920x1080
+          frame_rate: "23.976"
+        error: error
+        attempt: 0
+        output:
+          container: container
+          sha256: sha256
+          retention_expires_at: 2000-01-23T04:56:07.000+00:00
+          target_height: 1080
+          bytes: 2
+          width: 1920
+          state: pending
+          audio: true
+          height: 1080
+        completed_at: 2000-01-23T04:56:07.000+00:00
+        progress:
+          phase: ""
+          stage: stage
+          frames_done: 9
+          frames_total: 3
+          fps: 2.302136
+          phase_percent: 56.373768
+          percent: 59.621338
+          eta_seconds: 7
+        started_at: 2000-01-23T04:56:07.000+00:00
+        id: job_abc123def456
+        status_reason: status_reason
+        status: queued
+      properties:
+        id:
+          example: job_abc123def456
+          type: string
+        status:
+          $ref: "#/components/schemas/JobStatus"
+        status_reason:
+          type: string
+          nullable: true
+        attempt:
+          type: integer
+        retryable:
+          description: Whether the job can still be retried (attempt < max_attempts
+            and not terminal).
+          type: boolean
+        profile:
+          allOf:
+          - $ref: "#/components/schemas/JobProfile"
+          description: |
+            Public profile ID submitted by the customer. For adaptive jobs this
+            stays `sophon-auto`; see `effective_profile_id` for the worker's
+            resolved concrete profile.
+        effective_profile_id:
+          description: |
+            Concrete profile resolved by the worker. Omitted until dispatch
+            resolves. On explicit-profile jobs this equals `profile`; on
+            `sophon-auto` jobs it is an internal adaptive profile ID.
+          type: string
+          nullable: true
+        source:
+          $ref: "#/components/schemas/JobSourceInfo"
+        progress:
+          $ref: "#/components/schemas/JobProgress"
+        output:
+          $ref: "#/components/schemas/JobOutputInfo"
+        metadata:
+          additionalProperties: true
+          description: |
+            Arbitrary JSON object attached to a job. Keys and values are passed
+            through unchanged to webhook deliveries and echoed on job reads. The
+            serialized representation must not exceed 16 KiB. Free-form; SDKs
+            surface this as a `Record<string, unknown>` / `dict[str, Any]` /
+            `map[string]interface{}` depending on language.
+          type: object
+        created_at:
+          format: date-time
+          type: string
+        started_at:
+          format: date-time
+          type: string
+          nullable: true
+        completed_at:
+          format: date-time
+          type: string
+          nullable: true
+        error:
+          type: string
+          nullable: true
+      required:
+      - attempt
+      - created_at
+      - id
+      - metadata
+      - output
+      - profile
+      - progress
+      - retryable
+      - source
+      - status
+    JobSourceInfo:
+      example:
+        duration_seconds: 1.4658129805029452
+        sha256: sha256
+        bytes: 6
+        name: name
+        resolution: 1920x1080
+        frame_rate: "23.976"
+      properties:
+        name:
+          description: Original file name of the source.
+          type: string
+          nullable: true
+        bytes:
+          format: int64
+          type: integer
+          nullable: true
+        sha256:
+          description: SHA-256 hex digest of the source file.
+          type: string
+        duration_seconds:
+          format: double
+          type: number
+          nullable: true
+        resolution:
+          example: 1920x1080
+          type: string
+          nullable: true
+        frame_rate:
+          example: "23.976"
+          type: string
+          nullable: true
+      required:
+      - sha256
+    JobProgress:
+      example:
+        phase: ""
+        stage: stage
+        frames_done: 9
+        frames_total: 3
+        fps: 2.302136
+        phase_percent: 56.373768
+        percent: 59.621338
+        eta_seconds: 7
+      properties:
+        stage:
+          description: "Current processing stage label (e.g. \"probing\", \"encoding\"\
+            , \"muxing\")."
+          type: string
+          nullable: true
+        phase:
+          allOf:
+          - $ref: "#/components/schemas/JobStatus"
+          description: Canonical pipeline phase used for progress semantics.
+        percent:
+          format: float
+          maximum: 100
+          minimum: 0
+          type: number
+        phase_percent:
+          description: Progress within the current phase. Null before active processing.
+          format: float
+          maximum: 100
+          minimum: 0
+          type: number
+          nullable: true
+        fps:
+          format: float
+          type: number
+          nullable: true
+        eta_seconds:
+          type: integer
+          nullable: true
+        frames_done:
+          type: integer
+          nullable: true
+        frames_total:
+          type: integer
+          nullable: true
+      required:
+      - percent
+      - phase
+    JobOutputInfo:
+      example:
+        container: container
+        sha256: sha256
+        retention_expires_at: 2000-01-23T04:56:07.000+00:00
+        target_height: 1080
+        bytes: 2
+        width: 1920
+        state: pending
+        audio: true
+        height: 1080
+      properties:
+        state:
+          enum:
+          - pending
+          - available
+          type: string
+        container:
+          description: Output container format ("mp4" or "mkv").
+          type: string
+        audio:
+          description: |
+            Whether the output file actually contains audio.
+            Reflects the muxed result, not the request flag — a
+            video-only source with audio requested will report false.
+          type: boolean
+        target_height:
+          description: |
+            Customer-requested output height, echoed back. Null when the
+            job ran at source dimensions (passthrough).
+          example: 1080
+          type: integer
+          nullable: true
+        width:
+          description: |
+            Actual encoded output width in pixels (post-ffprobe). Null until
+            the job completes or if the probe failed.
+          example: 1920
+          type: integer
+          nullable: true
+        height:
+          description: Actual encoded output height in pixels. See `width`.
+          example: 1080
+          type: integer
+          nullable: true
+        bytes:
+          format: int64
+          type: integer
+          nullable: true
+        sha256:
+          type: string
+          nullable: true
+        retention_expires_at:
+          format: date-time
+          type: string
+          nullable: true
+      required:
+      - audio
+      - container
+      - state
+    ListJobsResponse:
+      example:
+        next_cursor: next_cursor
+        jobs:
+        - retryable: true
+          metadata:
+            key: ""
+          profile: ""
+          effective_profile_id: effective_profile_id
+          created_at: 2000-01-23T04:56:07.000+00:00
+          source:
+            duration_seconds: 1.4658129805029452
+            sha256: sha256
+            bytes: 6
+            name: name
+            resolution: 1920x1080
+            frame_rate: "23.976"
+          error: error
+          attempt: 0
+          output:
+            container: container
+            sha256: sha256
+            retention_expires_at: 2000-01-23T04:56:07.000+00:00
+            target_height: 1080
+            bytes: 2
+            width: 1920
+            state: pending
+            audio: true
+            height: 1080
+          completed_at: 2000-01-23T04:56:07.000+00:00
+          progress:
+            phase: ""
+            stage: stage
+            frames_done: 9
+            frames_total: 3
+            fps: 2.302136
+            phase_percent: 56.373768
+            percent: 59.621338
+            eta_seconds: 7
+          started_at: 2000-01-23T04:56:07.000+00:00
+          id: job_abc123def456
+          status_reason: status_reason
+          status: queued
+        - retryable: true
+          metadata:
+            key: ""
+          profile: ""
+          effective_profile_id: effective_profile_id
+          created_at: 2000-01-23T04:56:07.000+00:00
+          source:
+            duration_seconds: 1.4658129805029452
+            sha256: sha256
+            bytes: 6
+            name: name
+            resolution: 1920x1080
+            frame_rate: "23.976"
+          error: error
+          attempt: 0
+          output:
+            container: container
+            sha256: sha256
+            retention_expires_at: 2000-01-23T04:56:07.000+00:00
+            target_height: 1080
+            bytes: 2
+            width: 1920
+            state: pending
+            audio: true
+            height: 1080
+          completed_at: 2000-01-23T04:56:07.000+00:00
+          progress:
+            phase: ""
+            stage: stage
+            frames_done: 9
+            frames_total: 3
+            fps: 2.302136
+            phase_percent: 56.373768
+            percent: 59.621338
+            eta_seconds: 7
+          started_at: 2000-01-23T04:56:07.000+00:00
+          id: job_abc123def456
+          status_reason: status_reason
+          status: queued
+        has_more: true
+      properties:
+        jobs:
+          items:
+            $ref: "#/components/schemas/JobResponse"
+          type: array
+        next_cursor:
+          description: Opaque cursor for the next page. Null when no more results.
+          type: string
+          nullable: true
+        has_more:
+          type: boolean
+      required:
+      - has_more
+      - jobs
+    CreateUploadRequest:
+      example:
+        mime_type: mime_type
+        file_name: file_name
+        file_size: 1
+      properties:
+        file_name:
+          minLength: 1
+          type: string
+        file_size:
+          description: Total file size in bytes.
+          format: int64
+          minimum: 1
+          type: integer
+        mime_type:
+          type: string
+      required:
+      - file_name
+      - file_size
+      - mime_type
+    CreateUploadResponse:
+      example:
+        chunk_size: 0
+        expires_at: 2000-01-23T04:56:07.000+00:00
+        id: upl_abc123def456
+        total_chunks: 6
+      properties:
+        id:
+          example: upl_abc123def456
+          type: string
+        chunk_size:
+          description: |
+            Size of each chunk in bytes. Tiered by file size:
+            <64 MB = whole file, <=1 GB = 8 MB, <=10 GB = 16 MB, >10 GB = 32 MB.
+          format: int64
+          type: integer
+        total_chunks:
+          format: int64
+          type: integer
+        expires_at:
+          description: Upload session expiry (24 hours from creation).
+          format: date-time
+          type: string
+      required:
+      - chunk_size
+      - expires_at
+      - id
+      - total_chunks
+    UploadPartResponse:
+      example:
+        part_number: 0
+        received: true
+      properties:
+        part_number:
+          format: int64
+          type: integer
+        received:
+          type: boolean
+      required:
+      - part_number
+      - received
+    UploadStatusResponse:
+      example:
+        received_chunks:
+        - 6
+        - 6
+        expires_at: 2000-01-23T04:56:07.000+00:00
+        source_duration_seconds: 600.0
+        file_name: file_name
+        source_width: 3840
+        source_height: 2160
+        id: id
+        total_chunks: 0
+        status: uploading
+      properties:
+        id:
+          type: string
+        status:
+          enum:
+          - uploading
+          - assembling
+          - completed
+          - canceled
+          type: string
+        file_name:
+          type: string
+        total_chunks:
+          type: integer
+        received_chunks:
+          description: Array of 0-indexed part numbers that have been received.
+          items:
+            type: integer
+          type: array
+        expires_at:
+          format: date-time
+          type: string
+        source_width:
+          description: |
+            Source media width in pixels, populated from ffprobe after upload
+            assembly. Null for uploads in `initiated`/`uploading` state or
+            when probe failed.
+          example: 3840
+          type: integer
+          nullable: true
+        source_height:
+          description: Source media height in pixels. See `source_width`.
+          example: 2160
+          type: integer
+          nullable: true
+        source_duration_seconds:
+          description: |
+            Source media duration in seconds, from ffprobe after upload
+            assembly. Used by the webapp free-tier budget check to compute
+            realistic billable_seconds (5-second ceiling rounding).
+          example: 600.0
+          format: float
+          type: number
+          nullable: true
+      required:
+      - expires_at
+      - file_name
+      - id
+      - received_chunks
+      - status
+      - total_chunks
+    CompleteUploadResponse:
+      example:
+        sha256: sha256
+        bytes: 0
+        id: id
+        status: completed
+      properties:
+        id:
+          type: string
+        status:
+          enum:
+          - completed
+          type: string
+        sha256:
+          description: SHA-256 hex digest of the assembled file.
+          type: string
+        bytes:
+          format: int64
+          type: integer
+      required:
+      - bytes
+      - id
+      - sha256
+      - status
+    CreateWebhookRequest:
+      example:
+        name: name
+        url: https://openapi-generator.tech
+      properties:
+        url:
+          description: |
+            HTTPS URL to receive webhook deliveries. Must not point to
+            private, loopback, link-local, or multicast addresses (SSRF prevention).
+          format: uri
+          type: string
+        name:
+          type: string
+          nullable: true
+      required:
+      - url
+    WebhookResponse:
+      example:
+        active: true
+        created_at: 2000-01-23T04:56:07.000+00:00
+        id: wh_abc123def456
+        secret: secret
+        url: https://openapi-generator.tech
+      properties:
+        id:
+          example: wh_abc123def456
+          type: string
+        url:
+          format: uri
+          type: string
+        secret:
+          description: |
+            HMAC signing secret (64-char hex string, 32 random bytes).
+            Only returned on creation. Use to verify webhook delivery signatures.
+          type: string
+        active:
+          type: boolean
+        created_at:
+          format: date-time
+          type: string
+      required:
+      - active
+      - created_at
+      - id
+      - secret
+      - url
+    WebhookListItem:
+      example:
+        active: true
+        created_at: 2000-01-23T04:56:07.000+00:00
+        id: id
+        url: https://openapi-generator.tech
+      properties:
+        id:
+          type: string
+        url:
+          format: uri
+          type: string
+        active:
+          type: boolean
+        created_at:
+          format: date-time
+          type: string
+      required:
+      - active
+      - created_at
+      - id
+      - url
+    WebhookListResponse:
+      example:
+        webhooks:
+        - active: true
+          created_at: 2000-01-23T04:56:07.000+00:00
+          id: id
+          url: https://openapi-generator.tech
+        - active: true
+          created_at: 2000-01-23T04:56:07.000+00:00
+          id: id
+          url: https://openapi-generator.tech
+      properties:
+        webhooks:
+          items:
+            $ref: "#/components/schemas/WebhookListItem"
+          type: array
+      required:
+      - webhooks
+    ReadyResponse:
+      example:
+        checks_failed:
+        - checks_failed
+        - checks_failed
+        ready: true
+      properties:
+        ready:
+          type: boolean
+        checks_failed:
+          description: "Names of failed readiness checks (database, disk_critical,\
+            \ draining, workers_dead)."
+          items:
+            type: string
+          type: array
+      required:
+      - ready
+  securitySchemes:
+    bearerApiKey:
+      description: |
+        API key passed as `Authorization: Bearer <key>`.
+        Keys are scoped to an organization and carry permission scopes
+        (e.g. jobs:create, uploads:write, webhooks:manage).
+      scheme: bearer
+      type: http
+    sessionCookie:
+      description: "First-party dashboard session cookie (JWT, HS256)."
+      in: cookie
+      name: sophon_api_session
+      type: apiKey
