@@ -1,0 +1,12 @@
+Copyright (c) 2026 Liqhtworks
+
+All rights reserved.
+
+Use of this software is governed by a proprietary license. Redistribution
+of this package outside of its intended use (consuming the SOPHON Encoding
+API via a valid API key) is prohibited without prior written consent from
+Liqhtworks.
+
+This package is generated from the SOPHON OpenAPI specification at
+https://github.com/Liqhtworks/sophon-api. Do not edit it by hand — changes
+are overwritten on every release.
