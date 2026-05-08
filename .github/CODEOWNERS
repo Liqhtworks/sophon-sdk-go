@@ -1,0 +1,6 @@
+# This repository is generated from Liqhtworks/sophon-api at every
+# release. Source-side changes (helpers, OpenAPI spec, generator
+# config) belong in that repo, not here. Filing issues / PRs against
+# this repo is fine — Liqhtworks engineers triage them and route the
+# fix upstream as needed.
+*       @Liqhtworks/engineering

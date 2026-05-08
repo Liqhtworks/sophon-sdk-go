@@ -1,0 +1,8 @@
+blank_issues_enabled: false
+contact_links:
+  - name: SOPHON API documentation
+    url: https://registry.scalar.com/@liqhtworks/apis/sophon-encoding-api/latest
+    about: Reference for every endpoint the SDK wraps.
+  - name: API + spec issues (sophon-api)
+    url: https://github.com/Liqhtworks/sophon-api/issues
+    about: For server-side bugs or OpenAPI questions, file there. SDK bugs stay here.

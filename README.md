@@ -138,6 +138,23 @@ func handle(w http.ResponseWriter, r *http.Request) {
 
 - Go 1.22+
 
+## Versioning
+
+`github.com/Liqhtworks/sophon-sdk-go` follows
+[SemVer](https://semver.org/), with one pre-1.0 caveat: while we are at
+`v0.x`, **minor bumps may include breaking changes**. Pin to the v0.1
+line until 1.0:
+
+```bash
+go get github.com/Liqhtworks/sophon-sdk-go@v0.1
+```
+
+Patch releases (`v0.1.x`) are always backward-compatible — they ship
+bug fixes, helper-layer improvements, and additive types. Once we cut
+`v1.0.0`, regular SemVer applies and breaking changes only land on
+major bumps. See [`CHANGELOG.md`](./CHANGELOG.md) for the per-release
+log.
+
 ## License
 
 Proprietary — see [`LICENSE`](./LICENSE).
