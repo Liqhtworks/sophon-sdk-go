@@ -9,6 +9,186 @@ info:
     Authentication is via Bearer API key or session cookie. All POST endpoints
     require an Idempotency-Key header. List endpoints use opaque cursor-based
     pagination.
+
+    ---
+
+    ## Integration example
+
+    A real-world walkthrough of how [Daisy](https://daisy.so) wires SOPHON into
+    two production flows — user-uploaded video compression and automatic
+    post-generation encoding after video rendering. Both converge on the same
+    adapter and state machine; only the source differs.
+
+    The patterns below are the ones that transfer cleanly to any integration.
+
+    ### 1. One thin adapter, one method per endpoint
+
+    Keep the HTTP surface boring. Axios (or your stack's equivalent), a
+    per-endpoint idempotency key, and no enum for profile names:
+
+    ```ts
+    @Injectable()
+    export class SophonService {
+      private client() {
+        return axios.create({
+          baseURL: process.env.SOPHON_BASE_URL,
+          headers: { Authorization: `Bearer ${process.env.SOPHON_API_KEY}` },
+          timeout: 60_000,
+        });
+      }
+
+      async createUploadSession(req, idempotencyKey) { /* POST /v1/uploads */ }
+      async uploadChunk(uploadId, partNumber, bytes) { /* PUT /v1/uploads/{id}/parts/{n} */ }
+      async completeUpload(uploadId, idempotencyKey) { /* POST /v1/uploads/{id}/complete */ }
+      async createJob(req, idempotencyKey) { /* POST /v1/jobs */ }
+      async getJob(id) { /* GET /v1/jobs/{id} */ }
+      async downloadOutputStream(jobId) { /* GET /v1/jobs/{id}/output */ }
+    }
+    ```
+
+    **Suffix idempotency keys per endpoint.** SOPHON scopes dedupe per route
+    but a shared key collides across retries that hit different endpoints.
+    Do this:
+
+    ```ts
+    const base = `video:${video.id}:v1`;
+    await sophon.createUploadSession(req,  `${base}:create-upload`);
+    await sophon.completeUpload(uploadId,  `${base}:complete-upload`);
+    await sophon.createJob(req,            `${base}:create-job`);
+    ```
+
+    **Profile names are strings, not an enum.** We add and rename profiles
+    (`sophon-espresso` → `sophon-auto` → future variants). A TypeScript union
+    will drift; let the server validate.
+
+    ### 2. Model your pipeline as a state machine
+
+    Persist a single `sophonState` JSON column per row. `jobId === null`
+    routes to dispatch; anything else polls that job:
+
+    ```ts
+    interface SophonState {
+      jobId: string | null;          // null = not dispatched; string = poll it
+      uploadId?: string;             // persist between upload + createJob
+      profile?: string;              // sophon-auto | sophon-espresso | ...
+      dispatchRetries: number;       // 3 strikes → fallback
+      downloadRetries: number;
+      lastError?: { stage, code, message, at };
+    }
+
+    // In your cron (5-second tick is plenty):
+    if (state.jobId === null) {
+      await dispatch(video, state);  // upload + createJob
+    } else {
+      await poll(video, state);      // getJob + (if completed) downloadAndComplete
+    }
+    ```
+
+    Persisting `uploadId` between the upload completion and the `createJob`
+    call matters — a crash in that window otherwise re-uploads the file.
+
+    ### 3. Stream for large sources; buffer for small
+
+    User-uploaded sources can be 1 GB+. Stream S3 → SOPHON in chunks equal
+    to `session.chunk_size` from the createUploadSession response:
+
+    ```ts
+    async uploadStream(stream, fileName, mimeType, fileSize) {
+      const session = await this.createUploadSession({
+        file_name: fileName, file_size: fileSize, mime_type: mimeType,
+      });
+      let partIndex = 0, buffer = Buffer.alloc(0);
+      for await (const chunk of stream) {
+        buffer = Buffer.concat([buffer, chunk]);
+        while (buffer.length >= session.chunk_size) {
+          await this.uploadChunk(session.id, partIndex++,
+            buffer.subarray(0, session.chunk_size));
+          buffer = buffer.subarray(session.chunk_size);
+        }
+      }
+      if (buffer.length > 0) {
+        await this.uploadChunk(session.id, partIndex, buffer);
+      }
+      return this.completeUpload(session.id);
+    }
+    ```
+
+    Generated outputs from a model run are typically <30 MB — for those, a
+    buffered upload path is simpler and avoids managing a stream lifetime.
+
+    ### 4. Always keep a fallback URL
+
+    Before a row enters your encoding state, make sure the source is already
+    playable from your CDN. Every SOPHON failure then degrades to "use the
+    original" — the user's video never disappears because SOPHON is slow or
+    down. This is the single most important invariant:
+
+    ```ts
+    await videoRepository.update({ id: video.id }, {
+      videoUrl: sourceCloudfrontUrl,   // fallback URL, stays intact
+      status: VideoStatus.EncodingPending,
+      sophonState: { jobId: null, profile, dispatchRetries: 0, downloadRetries: 0 },
+      sourceFileSize: sourceBytes,
+    });
+    ```
+
+    On any terminal failure (structured `retryable: false`, retry budget
+    exhausted, 404 on getJob, 23h stuck-row guard), flip status back to
+    `Done` with `videoUrl` unchanged. SOPHON is enhancement, not a delivery
+    dependency.
+
+    ### 5. Handle the "no-gain" success path
+
+    `sophon-auto` runs a pre-probe and, when it decides the output wouldn't
+    be smaller than the source, returns `final_artifact: "original"` and
+    `saved_percent: 0`. Skip the output download — the source already lives
+    in your bucket:
+
+    ```ts
+    if (job.status === 'completed') {
+      if (job.final_artifact === 'original') {
+        // Persist outputFileSize = sourceFileSize so your UI shows
+        // "no reduction" instead of a missing value.
+        await completeWithFallbackOutput(video, job.output?.bytes ?? null);
+        return;
+      }
+      await downloadAndComplete(video, state, job.output?.bytes ?? null);
+    }
+    ```
+
+    ### 6. Finalize by streaming into your own storage
+
+    `GET /v1/jobs/{id}/output` returns a 302 to a presigned URL with a 24h
+    TTL. Stream that directly into your bucket — no temp file, no buffering:
+
+    ```ts
+    const { stream } = await sophon.downloadOutputStream(state.jobId);
+    const outputKey = `encoded/${video.userId}/${video.id}.mp4`;
+    await fileService.uploadStream(outputKey, stream, 'video/mp4');
+    await videoRepository.update({ id: video.id }, {
+      videoUrl: fileService.cloudfrontUrl(outputKey),
+      outputFileSize: sophonOutputBytes,
+      status: VideoStatus.Done,
+    });
+    ```
+
+    ### 7. Failure taxonomy
+
+    | Error | Handling |
+    |---|---|
+    | Structured `retryable: false` from SOPHON | Terminal. Fall back to `Done` with source URL. |
+    | Retryable upload / createJob failure | Increment `dispatchRetries`; after 3, fall back. |
+    | Retryable download failure | Increment `downloadRetries`; after 3, fall back. |
+    | `getJob` → HTTP 404 | Terminal. Job expired or never created. Fall back. |
+    | Transient poll network error | Do nothing; next tick retries. Don't burn retry budget. |
+    | Row stuck in encode state > 23h | Fall back (safety net against orphans). |
+
+    ### Minimal config
+
+    ```bash
+    SOPHON_API_KEY=sk_live_...
+    SOPHON_BASE_URL=https://api.liqhtworks.xyz
+    ```
   title: SOPHON Encoding API
   version: 1.0.0
 servers:
@@ -93,9 +273,28 @@ paths:
       - Jobs
     post:
       description: |
-        Creates a queued encoding job from a completed upload source. The
-        `profile` field accepts explicit coffee profiles or `sophon-auto`,
-        and `output.target_height` can request aspect-preserving downscale.
+        Creates a queued encoding job from a completed upload source.
+
+        **Picking `profile`:**
+        - Use `sophon-auto` unless you have a specific reason not to. It
+          picks per-source settings tuned for consistent output and
+          re-encodes at stricter settings if the first pass doesn't
+          hold up.
+        - Use an explicit coffee profile (`sophon-espresso` / `-cortado` /
+          `-americano`) when you want deterministic encoder behavior —
+          same settings regardless of source.
+        - Use an `-hq` variant when the source is a heavy format
+          (ProRes, DNxHD, high-bitrate camera originals). Larger output
+          files, maximum detail preservation.
+        - Use an `-hq-10bit` variant when the source is 10-bit and you
+          want to preserve that depth end-to-end (ProRes 422/4444,
+          DNxHD, BRAW, camera masters).
+
+        See `JobProfile` for the full enum.
+
+        `output.target_height` requests an aspect-preserving downscale
+        (width derived from source, both dims rounded to even). If absent
+        or larger than source, output uses source dimensions.
       operationId: createJob
       parameters:
       - $ref: "#/components/parameters/IdempotencyKey"
@@ -176,6 +375,39 @@ paths:
       summary: Submit an encoding job
       tags:
       - Jobs
+      x-codeSamples:
+      - lang: TypeScript
+        label: Dispatch from state machine
+        source: |
+          // Adapter pattern from the Integration example on the intro page.
+          // Per-endpoint idempotency-key suffix so retries don't collide
+          // with createUpload / completeUpload on the same video.
+          const job = await sophon.createJob(
+            {
+              source: { type: "upload", upload_id: uploadId },
+              profile: "sophon-auto",
+              output: { container: "mp4", audio: true },
+            },
+            `video:${video.id}:v1:create-job`,
+          );
+
+          // Persist jobId so the next cron tick polls instead of
+          // re-dispatching. `null` → "haven't dispatched yet".
+          await videoRepository.update({ id: video.id }, {
+            sophonState: { ...state, jobId: job.id },
+          });
+      - lang: curl
+        label: curl
+        source: |
+          curl -X POST https://api.liqhtworks.xyz/v1/jobs \
+            -H "Authorization: Bearer $SOPHON_API_KEY" \
+            -H "Idempotency-Key: video:123:v1:create-job" \
+            -H "Content-Type: application/json" \
+            -d '{
+              "source":  { "type": "upload", "upload_id": "upl_…" },
+              "profile": "sophon-auto",
+              "output":  { "container": "mp4", "audio": true }
+            }'
   /v1/jobs/{id}:
     delete:
       description: |
@@ -368,6 +600,38 @@ paths:
       summary: Get the encoded output file
       tags:
       - Jobs
+      x-codeSamples:
+      - lang: TypeScript
+        label: Finalize into your bucket (no temp file)
+        source: |
+          // Stream the 302'd presigned URL directly into your own
+          // bucket. Don't download to disk — no temp file, no buffer.
+          //
+          // Called from the poll success branch, AFTER checking
+          // `job.final_artifact !== "original"` (the "no-gain" path —
+          // see the Integration example on the intro page).
+          async downloadAndComplete(video, state, sophonOutputBytes) {
+            const { stream } = await this.sophonService.downloadOutputStream(
+              state.jobId,
+            );
+            const outputKey = `encoded/${video.userId}/${video.id}.mp4`;
+            await this.fileService.uploadStream(outputKey, stream, "video/mp4");
+
+            await this.videoRepository.update({ id: video.id }, {
+              videoUrl: this.fileService.cloudfrontUrl(outputKey),
+              outputFileSize: sophonOutputBytes,
+              status: VideoStatus.Done,
+              sophonState: { ...state, fallbackStatus: "ok" },
+            });
+          }
+      - lang: curl
+        label: curl (follow 302 and save)
+        source: |
+          # -L follows the 302 to the presigned URL and streams the
+          # output to stdout; here we pipe to a file.
+          curl -L -o encoded.mp4 \
+            -H "Authorization: Bearer $SOPHON_API_KEY" \
+            https://api.liqhtworks.xyz/v1/jobs/job_abc123/output
   /v1/uploads:
     post:
       description: |
@@ -453,6 +717,65 @@ paths:
       summary: Initialize a chunked upload session
       tags:
       - Uploads
+      x-codeSamples:
+      - lang: TypeScript
+        label: "Stream (large sources, up to 1 GB)"
+        source: |
+          // Stream an S3 (or any Readable) straight into SOPHON without
+          // buffering the whole file. Reads in `session.chunk_size`
+          // increments and never holds more than one chunk in memory.
+          async uploadStream(stream, fileName, mimeType, fileSize) {
+            const session = await this.createUploadSession(
+              { file_name: fileName, file_size: fileSize, mime_type: mimeType },
+              `video:${video.id}:v1:create-upload`,
+            );
+            let partIndex = 0, buffer = Buffer.alloc(0);
+            for await (const chunk of stream) {
+              buffer = Buffer.concat([buffer, chunk]);
+              while (buffer.length >= session.chunk_size) {
+                await this.uploadChunk(
+                  session.id,
+                  partIndex++,
+                  buffer.subarray(0, session.chunk_size),
+                );
+                buffer = buffer.subarray(session.chunk_size);
+              }
+            }
+            if (buffer.length > 0) {
+              await this.uploadChunk(session.id, partIndex, buffer);
+            }
+            return this.completeUpload(
+              session.id,
+              `video:${video.id}:v1:complete-upload`,
+            );
+          }
+      - lang: TypeScript
+        label: "Buffer (small outputs, <30 MB)"
+        source: |
+          // For small generated outputs where managing a stream is
+          // overkill. Download the source to memory, one-shot upload.
+          const response = await axios.get<ArrayBuffer>(video.videoUrl, {
+            responseType: "arraybuffer",
+            timeout: 60_000,
+          });
+          const buffer = Buffer.from(response.data);
+          const { uploadId } = await this.sophonService.uploadBuffer(
+            buffer,
+            `video-${video.id}.mp4`,
+            "video/mp4",
+          );
+      - lang: curl
+        label: curl (create session only)
+        source: |
+          curl -X POST https://api.liqhtworks.xyz/v1/uploads \
+            -H "Authorization: Bearer $SOPHON_API_KEY" \
+            -H "Idempotency-Key: video:123:v1:create-upload" \
+            -H "Content-Type: application/json" \
+            -d '{
+              "file_name": "input.mp4",
+              "file_size": 268435456,
+              "mime_type": "video/mp4"
+            }'
   /v1/uploads/{id}:
     delete:
       description: |
@@ -1208,32 +1531,76 @@ components:
       - type
     JobProfile:
       description: |
-        Encoding profile ID. Coffee-themed naming: prep time maps to encode speed,
-        bare name is the 8-bit default (universal decoder compatibility),
-        `-10bit` suffix opts into HEVC Main10 for higher-quality playback on
-        newer decoders.
+        Encoding profile ID. Coffee-themed naming: prep time maps to encode
+        speed (espresso = fast, cortado = medium, americano = slow). The
+        naming suffixes compose:
 
-        **8-bit (default):**
+        - bare name → 8-bit HEVC Main (universal decoder compatibility,
+          default)
+        - `-10bit` suffix → HEVC Main10 output. Requires a decoder that
+          supports Main10 (modern phones, modern TVs, Safari, Chrome
+          with hardware decode). Older / low-end devices may not play
+          Main10 output. Pick only when you know the downstream
+          pipeline supports it.
+        - `-hq` suffix → quality-biased 8-bit variant for heavy source
+          formats (ProRes, DNxHD, high-bitrate camera originals,
+          mastering-grade intermediates). Files will be larger than
+          the standard tier; pick when preserving detail matters more
+          than bitrate. Broad device compatibility (8-bit Main).
+        - `-hq-10bit` suffix → combines HQ with Main10 to preserve
+          10-bit depth end-to-end. Same Main10 compatibility caveat
+          as above; pick for ProRes 422/4444, DNxHD, BRAW, or camera
+          masters where detail AND bit depth matter and you control
+          the downstream pipeline.
+
+        **For broad audience playback, pick `sophon-auto` or an explicit
+        8-bit coffee profile.** `sophon-auto` produces 8-bit Main output
+        regardless of source bit depth.
+
+        If you're not sure which to pick, use `sophon-auto` — the API
+        picks per-source settings tuned for consistent output regardless
+        of what you submit, and automatically re-encodes at stricter
+        settings if the first pass doesn't hold up.
+
+        **8-bit (standard, default):**
         - `sophon-espresso` — fastest, lowest compression
         - `sophon-cortado` — balanced speed and quality
         - `sophon-americano` — slowest, highest compression
+
+        **8-bit HQ** (max quality preservation for heavy formats):
+        - `sophon-espresso-hq`
+        - `sophon-cortado-hq`
+        - `sophon-americano-hq`
 
         **10-bit (HEVC Main10):**
         - `sophon-espresso-10bit`
         - `sophon-cortado-10bit`
         - `sophon-americano-10bit`
 
+        **10-bit HQ** (max quality preservation AND preserves 10-bit depth):
+        - `sophon-espresso-hq-10bit`
+        - `sophon-cortado-hq-10bit`
+        - `sophon-americano-hq-10bit`
+
         **Adaptive dispatcher:**
-        - `sophon-auto` — public opt-in profile. The worker classifies
-          the source and records the concrete `effective_profile_id` on
-          the job once dispatch resolves.
+        - `sophon-auto` — content-adaptive. The API probes each source,
+          picks tuned settings, and re-encodes at stricter settings if
+          the first pass doesn't hold up. `profile` on the job response
+          stays `sophon-auto`; `effective_profile_id` records the
+          concrete variant the API actually ran.
       enum:
       - sophon-espresso
       - sophon-cortado
       - sophon-americano
+      - sophon-espresso-hq
+      - sophon-cortado-hq
+      - sophon-americano-hq
       - sophon-espresso-10bit
       - sophon-cortado-10bit
       - sophon-americano-10bit
+      - sophon-espresso-hq-10bit
+      - sophon-cortado-hq-10bit
+      - sophon-americano-hq-10bit
       - sophon-auto
       example: sophon-auto
       type: string
@@ -1413,8 +1780,11 @@ components:
         effective_profile_id:
           description: |
             Concrete profile resolved by the worker. Omitted until dispatch
-            resolves. On explicit-profile jobs this equals `profile`; on
-            `sophon-auto` jobs it is an internal adaptive profile ID.
+            resolves. On explicit-profile jobs this equals `profile`. On
+            `sophon-auto` jobs this is a variant identifier recording
+            which path the API routed the source through; exact encoder
+            settings for a given variant may be updated between releases
+            as the adaptive logic is tuned.
           type: string
           nullable: true
         source:
