@@ -85,6 +85,9 @@ func main() {
 of `"{timestamp}.{raw_body}"` against the `sha256=` header, plus a default
 5-minute replay window.
 
+For a complete `net/http` server, see
+[`examples/webhook-server`](./examples/webhook-server).
+
 ```go
 import (
     "io"
@@ -125,6 +128,11 @@ func handle(w http.ResponseWriter, r *http.Request) {
 | `helpers.OpenFileForUpload(path)` | Open a file path and return `(io.ReaderAt, size, closer, err)` ready for `UploadFile`. |
 | `helpers.WaitForJob(ctx, jobs, id, opts)` | Poll until terminal status (or a caller-specified set). Returns `*JobTerminalError` on `failed`/`canceled` (default set), `*JobTimeoutError` if the deadline elapses. |
 | `helpers.VerifyWebhookSignature(body, sig, ts, secret, opts)` | Constant-time HMAC verification + default 5-minute replay window. |
+
+## Examples
+
+- [`examples/webhook-server`](./examples/webhook-server) - `net/http`
+  endpoint that verifies raw request bytes before JSON parsing.
 
 ## Runtime support
 
