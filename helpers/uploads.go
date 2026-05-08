@@ -145,7 +145,10 @@ func UploadFile(
 		}
 		chunkSize = (sourceSize + totalChunks - 1) / totalChunks
 	} else {
-		s, err := api.CreateUpload(ctx, fileName, mimeType, sourceSize, idem)
+		// SOPHON scopes idempotency keys per-route. Same key on
+		// CreateUpload + CompleteUpload returns 409. Derive distinct
+		// per-route keys from the caller's seed so retries still work.
+		s, err := api.CreateUpload(ctx, fileName, mimeType, sourceSize, idem+"/create")
 		if err != nil {
 			return nil, fmt.Errorf("create upload: %w", err)
 		}
@@ -244,7 +247,7 @@ func UploadFile(
 		}
 	}
 
-	done, err := api.CompleteUpload(ctx, uploadID, idem)
+	done, err := api.CompleteUpload(ctx, uploadID, idem+"/complete")
 	if err != nil {
 		return nil, fmt.Errorf("complete upload: %w", err)
 	}
