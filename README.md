@@ -12,6 +12,21 @@ go get github.com/Liqhtworks/sophon-sdk-go@latest
 
 Requires Go 1.22+.
 
+## Get an API key
+
+1. Sign in at <https://liqhtworks.xyz/account/general>.
+2. In **API keys**, create a key for your server-side integration.
+3. Copy the `xt_live_...` token when it is shown. It is only shown once.
+4. Store it as an environment variable:
+
+```bash
+export SOPHON_API_KEY=xt_live_...
+export SOPHON_BASE_URL=https://api.liqhtworks.xyz
+```
+
+Keep API keys on the server. Do not ship them in client apps, public repos,
+logs, or analytics events.
+
 ## Quick start
 
 The SDK ships generated transport types and a `helpers/` subpackage with
@@ -19,13 +34,22 @@ ergonomic wrappers (chunked upload, job polling, webhook signature
 verification). The two `New*Client` functions bridge the generated client
 to the helpers' interfaces in one line each.
 
+This is the smallest complete server-side flow: upload a local video, create an
+encode job, wait for completion, and download the MP4 output.
+
 ```go
 package main
 
 import (
     "context"
     "fmt"
+    "io"
+    "net/http"
+    "net/url"
     "os"
+    "path/filepath"
+    "strings"
+    "time"
 
     sophon "github.com/Liqhtworks/sophon-sdk-go"
     "github.com/Liqhtworks/sophon-sdk-go/helpers"
@@ -33,9 +57,22 @@ import (
 )
 
 func main() {
+    inputPath := "./source.mov"
+    if len(os.Args) > 1 {
+        inputPath = os.Args[1]
+    }
+
+    apiKey := os.Getenv("SOPHON_API_KEY")
+    if apiKey == "" { panic("SOPHON_API_KEY is required") }
+
+    baseURL := os.Getenv("SOPHON_BASE_URL")
+    if baseURL == "" {
+        baseURL = "https://api.liqhtworks.xyz"
+    }
+
     cfg := sophon.NewConfiguration()
-    cfg.Servers = sophon.ServerConfigurations{{URL: "https://api.liqhtworks.xyz"}}
-    cfg.AddDefaultHeader("Authorization", "Bearer "+os.Getenv("SOPHON_API_KEY"))
+    cfg.Servers = sophon.ServerConfigurations{{URL: baseURL}}
+    cfg.AddDefaultHeader("Authorization", "Bearer "+apiKey)
     client := sophon.NewAPIClient(cfg)
 
     ctx := context.Background()
@@ -44,12 +81,16 @@ func main() {
     jobs    := helpers.NewJobsClient(client.JobsAPI)
 
     // 1. Upload a file (chunked, concurrent, resumable).
-    reader, size, closer, err := helpers.OpenFileForUpload("/path/to/source.mov")
+    reader, size, closer, err := helpers.OpenFileForUpload(inputPath)
     if err != nil { panic(err) }
     defer closer()
 
+    mimeType := "video/mp4"
+    if strings.EqualFold(filepath.Ext(inputPath), ".mov") {
+        mimeType = "video/quicktime"
+    }
     upload, err := helpers.UploadFile(
-        ctx, uploads, reader, size, "source.mov", "video/quicktime",
+        ctx, uploads, reader, size, filepath.Base(inputPath), mimeType,
         helpers.UploadFileOptions{
             Concurrency: 4,
             OnProgress: func(p helpers.UploadProgress) {
@@ -64,20 +105,86 @@ func main() {
     job, _, err := client.JobsAPI.CreateJob(ctx).
         IdempotencyKey(idempotencyKey).
         CreateJobRequest(sophon.CreateJobRequest{
-            Source: sophon.UploadJobSourceAsCreateJobRequestSource(
-                sophon.NewUploadJobSource("upload", upload.UploadID),
-            ),
-            Profile: "sophon-auto",
+            Source:  helpers.JobSource.Upload(upload.UploadID),
+            Profile: sophon.SOPHON_ESPRESSO,
         }).
         Execute()
     if err != nil { panic(err) }
 
     // 3. Wait for it to finish.
-    final, err := helpers.WaitForJob(ctx, jobs, job.GetId(), helpers.WaitForJobOptions{})
+    final, err := helpers.WaitForJob(ctx, jobs, job.GetId(), helpers.WaitForJobOptions{
+        Timeout: 30 * time.Minute,
+        OnProgress: func(j *helpers.Job) {
+            fmt.Printf("job %s: %s\n", j.ID, j.Status)
+        },
+    })
     if err != nil { panic(err) }
-    fmt.Println("status:", final.Status)
+    if final.Status != "completed" { panic("job ended in " + final.Status) }
+
+    // 4. Download the encoded output.
+    if err := downloadOutput(baseURL, apiKey, final.ID, "sophon-output.mp4"); err != nil {
+        panic(err)
+    }
+    fmt.Println("wrote sophon-output.mp4")
+}
+
+func downloadOutput(baseURL, apiKey, jobID, outputPath string) error {
+    client := &http.Client{
+        CheckRedirect: func(*http.Request, []*http.Request) error {
+            return http.ErrUseLastResponse
+        },
+        Timeout: 30 * time.Second,
+    }
+
+    req, err := http.NewRequest("GET", baseURL+"/v1/jobs/"+jobID+"/output", nil)
+    if err != nil { return err }
+    req.Header.Set("Authorization", "Bearer "+apiKey)
+
+    res, err := client.Do(req)
+    if err != nil { return err }
+    defer res.Body.Close()
+    if res.StatusCode != http.StatusFound {
+        return fmt.Errorf("expected output redirect, got %d", res.StatusCode)
+    }
+
+    location := res.Header.Get("Location")
+    if location == "" { return fmt.Errorf("missing output redirect") }
+
+    downloadURL, err := resolveURL(baseURL, location)
+    if err != nil { return err }
+
+    dl, err := http.Get(downloadURL)
+    if err != nil { return err }
+    defer dl.Body.Close()
+    if dl.StatusCode < 200 || dl.StatusCode >= 300 {
+        return fmt.Errorf("download failed: %d", dl.StatusCode)
+    }
+
+    out, err := os.Create(outputPath)
+    if err != nil { return err }
+    defer out.Close()
+    _, err = io.Copy(out, dl.Body)
+    return err
+}
+
+func resolveURL(baseURL, location string) (string, error) {
+    loc, err := url.Parse(location)
+    if err != nil { return "", err }
+    if loc.IsAbs() { return loc.String(), nil }
+    base, err := url.Parse(baseURL)
+    if err != nil { return "", err }
+    return base.ResolveReference(loc).String(), nil
 }
 ```
+
+For a runnable copy of this flow, see
+[`examples/encode-file`](./examples/encode-file).
+
+### Profile choice
+
+Use `sophon-auto` for production unless you need deterministic encoder
+settings. The quickstart uses `sophon-espresso` because it is the fastest
+smoke-test profile and always produces a new encoded output.
 
 ## Webhook verification
 
@@ -131,6 +238,8 @@ func handle(w http.ResponseWriter, r *http.Request) {
 
 ## Examples
 
+- [`examples/encode-file`](./examples/encode-file) - upload a local video,
+  create an encode job, wait for completion, and download the MP4 output.
 - [`examples/webhook-server`](./examples/webhook-server) - `net/http`
   endpoint that verifies raw request bytes before JSON parsing.
 
