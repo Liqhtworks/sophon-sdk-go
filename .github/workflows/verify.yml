@@ -1,8 +1,8 @@
-name: Verify module
+name: Go SDK CI
 
 # Go has no registry — `go get github.com/Liqhtworks/sophon-sdk-go@vX.Y.Z`
-# reads the tag directly. This workflow just runs `go build` + `go vet` on
-# each tagged commit so broken tags surface immediately.
+# reads the tag directly. PRs, main pushes, and tags validate the generated
+# module natively in the SDK repo.
 
 on:
   push:
@@ -11,18 +11,24 @@ on:
     branches:
       - main
   pull_request:
+  workflow_dispatch:
 
 permissions:
   contents: read
 
 jobs:
   verify:
-    name: go build + vet
+    name: go test + build + vet
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-go@v5
         with:
-          go-version: "1.22"
+          go-version: "1.23"
+      - name: Check module tidiness
+        run: |
+          go mod tidy
+          git diff --exit-code -- go.mod go.sum
+      - run: go test ./...
       - run: go build ./...
       - run: go vet ./...

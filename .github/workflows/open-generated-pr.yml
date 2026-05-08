@@ -1,0 +1,63 @@
+name: Open Generated SDK PR
+
+# The sophon-api Sync SDK Update PRs workflow pushes generated branches into
+# this repo. This workflow uses the repo-local GITHUB_TOKEN to open or update
+# the PR, so the cross-repo token only needs contents:write.
+
+on:
+  push:
+    branches:
+      - "generated/sophon-api-*"
+
+permissions:
+  contents: read
+  pull-requests: write
+
+jobs:
+  open:
+    name: Open or update PR
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Open or update generated SDK PR
+        env:
+          GH_TOKEN: ${{ github.token }}
+          BRANCH: ${{ github.ref_name }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          title="$(git log -1 --format=%s)"
+          body="$(git log -1 --format=%B | sed '1d')"
+          if [ -z "${body}" ]; then
+            body="Generated SDK update from sophon-api."
+          fi
+
+          existing="$(
+            gh api --method GET "repos/${GITHUB_REPOSITORY}/pulls" \
+              -f state=open \
+              -f head="${GITHUB_REPOSITORY_OWNER}:${BRANCH}" \
+              -f base=main \
+              --jq '.[0].number // empty'
+          )"
+
+          body_file="$(mktemp)"
+          printf '%s\n' "${body}" > "${body_file}"
+
+          if [ -n "${existing}" ]; then
+            gh pr edit "${existing}" \
+              --repo "${GITHUB_REPOSITORY}" \
+              --title "${title}" \
+              --body-file "${body_file}"
+            echo "Updated PR #${existing}"
+          else
+            gh pr create \
+              --repo "${GITHUB_REPOSITORY}" \
+              --base main \
+              --head "${BRANCH}" \
+              --title "${title}" \
+              --body-file "${body_file}"
+          fi
