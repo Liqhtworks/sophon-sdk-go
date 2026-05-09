@@ -1,6 +1,6 @@
 # sophon-sdk-go
 
-Official Go SDK for the [SOPHON Encoding API](https://liqhtworks.xyz).
+Official Go SDK for the [SOPHON Encoding API](https://sophon.rs).
 
 > **This package is generated.** Source lives in [Liqhtworks/sophon-api](https://github.com/Liqhtworks/sophon-api) (`api/openapi.yaml` + `api/sdk/helpers/go/`). Do not edit files in this repository by hand — changes are overwritten on every release.
 
@@ -14,7 +14,7 @@ Requires Go 1.22+.
 
 ## Get an API key
 
-1. Sign in at <https://liqhtworks.xyz/account/general>.
+1. Sign in at <https://sophon.rs/account/general>.
 2. In **API keys**, create a key for your server-side integration.
 3. Copy the `xt_live_...` token when it is shown. It is only shown once.
 4. Store it as an environment variable:
