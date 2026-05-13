@@ -2,29 +2,359 @@ openapi: 3.1.0
 info:
   contact:
     name: Liqhtworks
-    url: https://liqhtworks.xyz
+    url: https://sophon.rs
   description: |
     REST API for submitting, monitoring, and retrieving SOPHON encoding jobs.
 
-    Authentication is via Bearer API key or session cookie. All POST endpoints
-    require an Idempotency-Key header. List endpoints use opaque cursor-based
-    pagination.
+    ## Client Libraries
 
-    ---
+    For server-side application integrations, start with one of the official
+    SOPHON client libraries. Current published version: `0.1.5`.
 
-    ## Integration example
+    | Language | Package | Install |
+    |---|---|---|
+    | TypeScript / JavaScript | [`@liqhtworks/sophon-sdk`](https://www.npmjs.com/package/@liqhtworks/sophon-sdk) | `npm install @liqhtworks/sophon-sdk` |
+    | Python | [`sophon-sdk`](https://pypi.org/project/sophon-sdk/) | `pip install sophon-sdk` |
+    | Go | [`github.com/Liqhtworks/sophon-sdk-go`](https://github.com/Liqhtworks/sophon-sdk-go) | `go get github.com/Liqhtworks/sophon-sdk-go@latest` |
 
+    These libraries are generated from this OpenAPI document and include the
+    generated endpoint clients plus helpers for chunked uploads, terminal job
+    polling, upload-backed job source construction, and webhook signature
+    verification.
+
+    We do not currently publish official SDKs for Ruby, Java, Kotlin, Swift,
+    PHP, .NET, or Rust. Use the REST API directly from those languages.
+
+    Authentication is via Bearer API key or session cookie. Create API keys in
+    the SOPHON dashboard at https://sophon.rs/account/general and pass
+    them as `Authorization: Bearer xt_live_...`. All POST endpoints require an
+    `Idempotency-Key` header. List endpoints use opaque cursor-based pagination.
+
+    See **SDKs** for install commands and quickstarts. See **Integration
+    example** for a production state-machine pattern and raw HTTP adapter
+    guidance.
+  title: SOPHON Encoding API
+  version: 1.0.0
+servers:
+- description: Production
+  url: https://api.liqhtworks.xyz
+security:
+- bearerApiKey: []
+- sessionCookie: []
+tags:
+- description: "Submit, inspect, cancel, and retrieve encoding jobs."
+  name: Jobs
+- description: Create chunked uploads and assemble source media.
+  name: Uploads
+- description: Manage outbound terminal-job webhook endpoints.
+  name: Webhooks
+- description: |
+    Outbound webhook payloads delivered by SOPHON when a job reaches a
+    terminal state.
+
+    ### Delivery semantics
+
+    - **Trigger**: a delivery is enqueued when a job transitions to
+      `completed`, `failed`, or `canceled`. No deliveries for
+      `queued`, `running`, or interim `progress` events.
+    - **Subscription**: only the webhooks listed in
+      `CreateJobRequest.webhook_ids` for that specific job receive
+      deliveries. Registering a webhook does not subscribe it
+      retroactively or to all org jobs.
+    - **Timeout**: each delivery attempt waits up to **10 seconds**
+      for a 2xx response. Anything beyond that, or any non-2xx, is
+      treated as a failure and triggers a retry.
+    - **Retries**: up to **3 total attempts** (1 initial + 2 retries).
+      Backoff between attempts is approximately **10s, then 60s**
+      (the third gap, if it were used, would be 300s — but the 3rd
+      attempt is the last). Deliveries that exhaust the retry budget
+      are logged and dropped; there is no dead-letter queue the
+      customer can inspect.
+    - **Ordering**: not guaranteed. A consumer that needs strict
+      ordering should treat `X-Turbo-Event-Id` as the dedupe key and
+      reconcile state from `GET /v1/jobs/{id}` if events arrive out
+      of order.
+    - **At-least-once**: a delivery may be retried after a consumer's
+      transient failure, so the same `event_id` can arrive more than
+      once. Idempotent processing is required.
+    - **Signature**: every delivery carries `X-Turbo-Signature-256`
+      (HMAC-SHA256 of `"{X-Turbo-Timestamp}.{raw_body}"` using the
+      per-webhook secret). Verify on the raw bytes BEFORE JSON-parsing.
+  name: Webhook Events
+- description: Resolve signed output download tokens.
+  name: Downloads
+- description: "Service health, readiness, version, and metrics endpoints."
+  name: Health
+- description: |
+    Official SDKs are the recommended way to integrate SOPHON from
+    server-side application code. Current published version: `0.1.5`.
+
+    Repositories and package registries:
+
+    | Language | Install | Links |
+    |---|---|---|
+    | TypeScript / JavaScript | `npm install @liqhtworks/sophon-sdk` | [npm](https://www.npmjs.com/package/@liqhtworks/sophon-sdk), [GitHub](https://github.com/Liqhtworks/sophon-sdk-typescript) |
+    | Python | `pip install sophon-sdk` | [PyPI](https://pypi.org/project/sophon-sdk/), [GitHub](https://github.com/Liqhtworks/sophon-sdk-python) |
+    | Go | `go get github.com/Liqhtworks/sophon-sdk-go@latest` | [GitHub](https://github.com/Liqhtworks/sophon-sdk-go) |
+
+    ### Get an API key
+
+    Create a server-side API key in the dashboard:
+    https://sophon.rs/account/general
+
+    ```bash
+    export SOPHON_API_KEY=xt_live_...
+    export SOPHON_BASE_URL=https://api.liqhtworks.xyz
+    ```
+
+    Keep API keys on the server. Do not ship them in browser bundles,
+    mobile apps, public repositories, logs, or analytics events.
+
+    ### What the helpers cover
+
+    | Helper | Languages | Purpose |
+    |---|---|---|
+    | `uploadFile` / `upload_file` / `UploadFile` | TypeScript, Python, Go | Chunked upload orchestration with bounded concurrency, retries, resume, and progress callbacks. |
+    | `JobSource.upload` / `JobSource.Upload` | TypeScript, Python, Go | Construct a typed upload-backed job source from a completed upload ID. |
+    | `waitForJob` / `wait_for_job` / `WaitForJob` | TypeScript, Python, Go | Poll until a terminal job status with timeout and typed terminal/timeout errors. |
+    | `verifyWebhookSignature` / `verify_webhook_signature` / `VerifyWebhookSignature` | TypeScript, Python, Go | Verify `X-Turbo-Signature-256` over the raw request body before JSON parsing. |
+
+    ### TypeScript quickstart
+
+    Requires Node 18+ or a runtime with `fetch`, `Blob`, `AbortController`,
+    and Web Crypto.
+
+    ```ts
+    import { Blob } from "node:buffer";
+    import { randomUUID } from "node:crypto";
+    import { readFile, writeFile } from "node:fs/promises";
+    import {
+      Configuration,
+      JobProfile,
+      JobSource,
+      JobStatus,
+      JobsApi,
+      UploadsApi,
+      uploadFile,
+      waitForJob,
+    } from "@liqhtworks/sophon-sdk";
+
+    const apiKey = process.env.SOPHON_API_KEY;
+    if (!apiKey) throw new Error("SOPHON_API_KEY is required");
+
+    const basePath = process.env.SOPHON_BASE_URL ?? "https://api.liqhtworks.xyz";
+    const config = new Configuration({ basePath, accessToken: apiKey });
+    const uploads = new UploadsApi(config);
+    const jobs = new JobsApi(config);
+
+    const bytes = await readFile("source.mov");
+    const upload = await uploadFile({
+      api: uploads,
+      source: new Blob([bytes], { type: "video/quicktime" }),
+      fileName: "source.mov",
+      mimeType: "video/quicktime",
+      concurrency: 4,
+    });
+
+    const job = await jobs.createJob({
+      idempotencyKey: randomUUID(),
+      createJobRequest: {
+        source: JobSource.upload(upload.uploadId),
+        profile: JobProfile.SOPHON_AUTO,
+      },
+    });
+
+    const final = await waitForJob({
+      api: jobs,
+      jobId: job.id,
+      timeoutMs: 30 * 60 * 1000,
+    });
+    if (final.status !== JobStatus.COMPLETED) {
+      throw new Error(`job ended in ${final.status}`);
+    }
+
+    const redirect = await fetch(`${basePath}/v1/jobs/${final.id}/output`, {
+      headers: { authorization: `Bearer ${apiKey}` },
+      redirect: "manual",
+    });
+    const location = redirect.headers.get("location");
+    if (!location) throw new Error("missing output redirect");
+
+    const download = await fetch(new URL(location, basePath));
+    await writeFile("sophon-output.mp4", Buffer.from(await download.arrayBuffer()));
+    ```
+
+    ### Python quickstart
+
+    Requires Python 3.9+.
+
+    ```python
+    import os
+    import urllib.parse
+    import urllib.request
+    import uuid
+    from pathlib import Path
+
+    import sophon_sdk
+    from sophon_sdk.models.create_job_request import CreateJobRequest
+
+    api_key = os.environ["SOPHON_API_KEY"]
+    base_url = os.getenv("SOPHON_BASE_URL", "https://api.liqhtworks.xyz")
+
+    class NoRedirectHandler(urllib.request.HTTPRedirectHandler):
+        def http_error_302(self, req, fp, code, msg, headers):
+            response = urllib.request.addinfourl(fp, headers, req.get_full_url())
+            response.code = code
+            return response
+
+        http_error_301 = http_error_303 = http_error_307 = http_error_302
+
+    configuration = sophon_sdk.Configuration(host=base_url, access_token=api_key)
+
+    with sophon_sdk.ApiClient(configuration) as api_client:
+        uploads = sophon_sdk.UploadsApi(api_client)
+        jobs = sophon_sdk.JobsApi(api_client)
+
+        upload = sophon_sdk.upload_file(
+            uploads,
+            Path("source.mov"),
+            file_name="source.mov",
+            mime_type="video/quicktime",
+            concurrency=4,
+        )
+
+        job = sophon_sdk.create_job(
+            jobs,
+            idempotency_key=str(uuid.uuid4()),
+            create_job_request=CreateJobRequest(
+                source=sophon_sdk.JobSource.upload(upload.upload_id),
+                profile="sophon-auto",
+            ),
+        )
+
+        final = sophon_sdk.wait_for_job(jobs, job.id, timeout_seconds=30 * 60)
+        if final.status != "completed":
+            raise RuntimeError(f"job ended in {final.status}")
+
+        req = urllib.request.Request(
+            f"{base_url}/v1/jobs/{final.id}/output",
+            headers={"Authorization": f"Bearer {api_key}"},
+        )
+        opener = urllib.request.build_opener(NoRedirectHandler())
+        redirect = opener.open(req)
+        location = redirect.headers.get("Location")
+        if not location:
+            raise RuntimeError("missing output redirect")
+
+        download_url = urllib.parse.urljoin(base_url.rstrip("/") + "/", location)
+        with urllib.request.urlopen(download_url, timeout=60) as response:
+            Path("sophon-output.mp4").write_bytes(response.read())
+    ```
+
+    ### Go quickstart
+
+    Requires Go 1.22+.
+
+    ```go
+    package main
+
+    import (
+        "context"
+        "os"
+        "time"
+
+        sophon "github.com/Liqhtworks/sophon-sdk-go"
+        "github.com/Liqhtworks/sophon-sdk-go/helpers"
+        "github.com/google/uuid"
+    )
+
+    func main() {
+        ctx := context.Background()
+        apiKey := os.Getenv("SOPHON_API_KEY")
+        baseURL := os.Getenv("SOPHON_BASE_URL")
+        if baseURL == "" {
+            baseURL = "https://api.liqhtworks.xyz"
+        }
+
+        cfg := sophon.NewConfiguration()
+        cfg.Servers = sophon.ServerConfigurations{{URL: baseURL}}
+        cfg.AddDefaultHeader("Authorization", "Bearer "+apiKey)
+        client := sophon.NewAPIClient(cfg)
+
+        uploads := helpers.NewUploadsClient(client.UploadsAPI)
+        jobs := helpers.NewJobsClient(client.JobsAPI)
+
+        reader, size, closeFn, err := helpers.OpenFileForUpload("source.mov")
+        if err != nil {
+            panic(err)
+        }
+        defer closeFn()
+
+        upload, err := helpers.UploadFile(
+            ctx,
+            uploads,
+            reader,
+            size,
+            "source.mov",
+            "video/quicktime",
+            helpers.UploadFileOptions{Concurrency: 4},
+        )
+        if err != nil {
+            panic(err)
+        }
+
+        job, _, err := client.JobsAPI.CreateJob(ctx).
+            IdempotencyKey(uuid.NewString()).
+            CreateJobRequest(sophon.CreateJobRequest{
+                Source: helpers.JobSource.Upload(upload.UploadID),
+                Profile: sophon.SOPHON_AUTO,
+            }).
+            Execute()
+        if err != nil {
+            panic(err)
+        }
+
+        final, err := helpers.WaitForJob(ctx, jobs, job.GetId(), helpers.WaitForJobOptions{
+            Timeout: 30 * time.Minute,
+        })
+        if err != nil {
+            panic(err)
+        }
+        if final.Status != "completed" {
+            panic("job ended in " + final.Status)
+        }
+    }
+    ```
+
+    ### Profile choice
+
+    Use `sophon-auto` for production unless you need deterministic encoder
+    settings. The SDK README quickstarts may use `sophon-espresso` for fast
+    smoke tests, but production apps should default to `sophon-auto`.
+
+    ### Webhooks
+
+    Verify webhook signatures with the raw request body before JSON parsing.
+    Complete server examples are available in each SDK repository:
+
+    - TypeScript: Express
+    - Python: FastAPI
+    - Go: `net/http`
+  name: SDKs
+- description: |
     A real-world walkthrough of how [Daisy](https://daisy.so) wires SOPHON into
     two production flows — user-uploaded video compression and automatic
     post-generation encoding after video rendering. Both converge on the same
     adapter and state machine; only the source differs.
 
-    The patterns below are the ones that transfer cleanly to any integration.
+    The official SDKs cover the common upload, create-job, polling, and
+    webhook-verification paths. The lower-level patterns below are useful
+    when you need a custom HTTP adapter or a durable production state machine.
 
     ### 1. One thin adapter, one method per endpoint
 
     Keep the HTTP surface boring. Axios (or your stack's equivalent), a
-    per-endpoint idempotency key, and no enum for profile names:
+    per-endpoint idempotency key, and profile names that the server validates:
 
     ```ts
     @Injectable()
@@ -186,30 +516,10 @@ info:
     ### Minimal config
 
     ```bash
-    SOPHON_API_KEY=sk_live_...
+    SOPHON_API_KEY=xt_live_...
     SOPHON_BASE_URL=https://api.liqhtworks.xyz
     ```
-  title: SOPHON Encoding API
-  version: 1.0.0
-servers:
-- description: Production
-  url: https://api.liqhtworks.xyz
-security:
-- bearerApiKey: []
-- sessionCookie: []
-tags:
-- description: "Submit, inspect, cancel, and retrieve encoding jobs."
-  name: Jobs
-- description: Create chunked uploads and assemble source media.
-  name: Uploads
-- description: Manage outbound terminal-job webhook endpoints.
-  name: Webhooks
-- description: Outbound webhook payloads delivered by SOPHON.
-  name: Webhook Events
-- description: Resolve signed output download tokens.
-  name: Downloads
-- description: "Service health, readiness, version, and metrics endpoints."
-  name: Health
+  name: Integration example
 paths:
   /v1/jobs:
     get:
@@ -377,22 +687,27 @@ paths:
       - Jobs
       x-codeSamples:
       - lang: TypeScript
-        label: Dispatch from state machine
+        label: SDK create job from upload
         source: |
-          // Adapter pattern from the Integration example on the intro page.
-          // Per-endpoint idempotency-key suffix so retries don't collide
-          // with createUpload / completeUpload on the same video.
-          const job = await sophon.createJob(
-            {
-              source: { type: "upload", upload_id: uploadId },
-              profile: "sophon-auto",
+          import { randomUUID } from "node:crypto";
+          import {
+            JobProfile,
+            JobSource,
+            JobsApi,
+          } from "@liqhtworks/sophon-sdk";
+
+          const jobs = new JobsApi(config);
+          const job = await jobs.createJob({
+            idempotencyKey: randomUUID(),
+            createJobRequest: {
+              source: JobSource.upload(uploadId),
+              profile: JobProfile.SOPHON_AUTO,
               output: { container: "mp4", audio: true },
             },
-            `video:${video.id}:v1:create-job`,
-          );
+          });
 
           // Persist jobId so the next cron tick polls instead of
-          // re-dispatching. `null` → "haven't dispatched yet".
+          // re-dispatching. `null` means "not dispatched yet".
           await videoRepository.update({ id: video.id }, {
             sophonState: { ...state, jobId: job.id },
           });
@@ -602,28 +917,34 @@ paths:
       - Jobs
       x-codeSamples:
       - lang: TypeScript
-        label: Finalize into your bucket (no temp file)
+        label: "SDK poll, resolve 302, download"
         source: |
-          // Stream the 302'd presigned URL directly into your own
-          // bucket. Don't download to disk — no temp file, no buffer.
-          //
-          // Called from the poll success branch, AFTER checking
-          // `job.final_artifact !== "original"` (the "no-gain" path —
-          // see the Integration example on the intro page).
-          async downloadAndComplete(video, state, sophonOutputBytes) {
-            const { stream } = await this.sophonService.downloadOutputStream(
-              state.jobId,
-            );
-            const outputKey = `encoded/${video.userId}/${video.id}.mp4`;
-            await this.fileService.uploadStream(outputKey, stream, "video/mp4");
+          import { writeFile } from "node:fs/promises";
+          import { JobStatus, waitForJob } from "@liqhtworks/sophon-sdk";
 
-            await this.videoRepository.update({ id: video.id }, {
-              videoUrl: this.fileService.cloudfrontUrl(outputKey),
-              outputFileSize: sophonOutputBytes,
-              status: VideoStatus.Done,
-              sophonState: { ...state, fallbackStatus: "ok" },
-            });
+          const final = await waitForJob({
+            api: jobs,
+            jobId,
+            timeoutMs: 30 * 60 * 1000,
+          });
+          if (final.status !== JobStatus.COMPLETED) {
+            throw new Error(`job ended in ${final.status}`);
           }
+
+          // Use raw fetch so redirects are explicit. The SDK intentionally
+          // does not follow the 302 and buffer the whole output in memory.
+          const redirect = await fetch(`${basePath}/v1/jobs/${final.id}/output`, {
+            headers: { authorization: `Bearer ${apiKey}` },
+            redirect: "manual",
+          });
+          if (redirect.status !== 302) {
+            throw new Error(`expected 302, got ${redirect.status}`);
+          }
+          const location = redirect.headers.get("location");
+          if (!location) throw new Error("missing output redirect");
+
+          const download = await fetch(new URL(location, basePath));
+          await writeFile("sophon-output.mp4", Buffer.from(await download.arrayBuffer()));
       - lang: curl
         label: curl (follow 302 and save)
         source: |
@@ -719,51 +1040,28 @@ paths:
       - Uploads
       x-codeSamples:
       - lang: TypeScript
-        label: "Stream (large sources, up to 1 GB)"
+        label: SDK upload helper
         source: |
-          // Stream an S3 (or any Readable) straight into SOPHON without
-          // buffering the whole file. Reads in `session.chunk_size`
-          // increments and never holds more than one chunk in memory.
-          async uploadStream(stream, fileName, mimeType, fileSize) {
-            const session = await this.createUploadSession(
-              { file_name: fileName, file_size: fileSize, mime_type: mimeType },
-              `video:${video.id}:v1:create-upload`,
-            );
-            let partIndex = 0, buffer = Buffer.alloc(0);
-            for await (const chunk of stream) {
-              buffer = Buffer.concat([buffer, chunk]);
-              while (buffer.length >= session.chunk_size) {
-                await this.uploadChunk(
-                  session.id,
-                  partIndex++,
-                  buffer.subarray(0, session.chunk_size),
-                );
-                buffer = buffer.subarray(session.chunk_size);
-              }
-            }
-            if (buffer.length > 0) {
-              await this.uploadChunk(session.id, partIndex, buffer);
-            }
-            return this.completeUpload(
-              session.id,
-              `video:${video.id}:v1:complete-upload`,
-            );
-          }
-      - lang: TypeScript
-        label: "Buffer (small outputs, <30 MB)"
-        source: |
-          // For small generated outputs where managing a stream is
-          // overkill. Download the source to memory, one-shot upload.
-          const response = await axios.get<ArrayBuffer>(video.videoUrl, {
-            responseType: "arraybuffer",
-            timeout: 60_000,
+          import { Blob } from "node:buffer";
+          import { readFile } from "node:fs/promises";
+          import {
+            UploadsApi,
+            uploadFile,
+          } from "@liqhtworks/sophon-sdk";
+
+          const uploads = new UploadsApi(config);
+          const bytes = await readFile("input.mp4");
+          const upload = await uploadFile({
+            api: uploads,
+            source: new Blob([bytes], { type: "video/mp4" }),
+            fileName: "input.mp4",
+            mimeType: "video/mp4",
+            concurrency: 4,
+            onProgress: (p) => console.log(`${p.partsDone}/${p.partsTotal} parts`),
           });
-          const buffer = Buffer.from(response.data);
-          const { uploadId } = await this.sophonService.uploadBuffer(
-            buffer,
-            `video-${video.id}.mp4`,
-            "video/mp4",
-          );
+
+          // Pass this to createJob as JobSource.upload(upload.uploadId).
+          console.log(upload.uploadId);
       - lang: curl
         label: curl (create session only)
         source: |
