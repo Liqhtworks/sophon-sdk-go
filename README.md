@@ -1,5 +1,7 @@
 # sophon-sdk-go
 
+> **Alpha:** This SDK is in alpha. Please report any bugs or errors by opening an [issue](https://github.com/Liqhtworks/sophon-sdk-go/issues).
+
 Official Go SDK for the [SOPHON Encoding API](https://sophon.rs).
 
 > **This package is generated.** Source lives in [Liqhtworks/sophon-api](https://github.com/Liqhtworks/sophon-api) (`api/openapi.yaml` + `api/sdk/helpers/go/`). Do not edit files in this repository by hand — changes are overwritten on every release.
