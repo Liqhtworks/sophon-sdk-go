@@ -64,10 +64,16 @@ type UploadFileOptions struct {
 	UploadID string
 	// Parallel in-flight parts. Default 4.
 	Concurrency int
-	// Per-part retry count for retryable errors. Default 3.
+	// Per-part retry count for retryable errors. Pass a negative value
+	// (e.g. -1) to apply the default of 3. An explicit zero is honored
+	// literally — no retries beyond the first attempt.
 	Retries int
 	// Base retry backoff; doubles each attempt with jitter. Default 500ms.
 	RetryBase time.Duration
+	// Per-attempt timeout for each UploadPart call. Default 60s. Pass a
+	// negative value to disable. Without this bound, a stalled UploadPart
+	// would wedge a worker indefinitely on a context without a deadline.
+	PartTimeout time.Duration
 	// Reused for create+complete. Auto-generated when empty.
 	IdempotencyKey string
 	// Optional progress callback.
@@ -84,13 +90,25 @@ func (e *RetryableError) Unwrap() error { return e.Err }
 type HTTPStatusCarrier interface{ HTTPStatus() int }
 
 func isRetryable(err error) bool {
+	if err == nil {
+		return false
+	}
 	var re *RetryableError
 	if errors.As(err, &re) {
+		return true
+	}
+	// Per-attempt deadline exceeded is retryable; a parent-context cancel
+	// is not (caller already gave up).
+	if errors.Is(err, context.DeadlineExceeded) {
 		return true
 	}
 	var sc HTTPStatusCarrier
 	if errors.As(err, &sc) {
 		s := sc.HTTPStatus()
+		if s == 0 {
+			// NetworkError surfaces as status=0 — treat as retryable.
+			return true
+		}
 		return s == 408 || s == 429 || (s >= 500 && s < 600)
 	}
 	return false
@@ -113,14 +131,18 @@ func UploadFile(
 	}
 	retries := opts.Retries
 	if retries < 0 {
-		return nil, fmt.Errorf("retries must be >= 0")
-	}
-	if retries == 0 {
 		retries = 3
 	}
 	retryBase := opts.RetryBase
 	if retryBase <= 0 {
 		retryBase = 500 * time.Millisecond
+	}
+	partTimeout := opts.PartTimeout
+	if partTimeout == 0 {
+		partTimeout = 60 * time.Second
+	}
+	if partTimeout < 0 {
+		partTimeout = 0
 	}
 	idem := opts.IdempotencyKey
 	if idem == "" {
@@ -210,6 +232,11 @@ func UploadFile(
 						return
 					}
 					if err := withRetry(ctx, retries, retryBase, func() error {
+						if partTimeout > 0 {
+							pctx, cancel := context.WithTimeout(ctx, partTimeout)
+							defer cancel()
+							return api.UploadPart(pctx, uploadID, partNum, chunk)
+						}
 						return api.UploadPart(ctx, uploadID, partNum, chunk)
 					}); err != nil {
 						errCh <- fmt.Errorf("upload part %d: %w", partNum, err)

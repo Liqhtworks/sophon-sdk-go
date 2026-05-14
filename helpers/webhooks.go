@@ -4,9 +4,21 @@ import (
 	"crypto/hmac"
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
 	"fmt"
+	"io"
+	"net/http"
 	"strings"
 	"time"
+
+	sophon "github.com/Liqhtworks/sophon-sdk-go"
+)
+
+// Webhook delivery header names. Exported so tests / proxies can rewrite
+// them if upstream renames an envelope header without bumping major.
+const (
+	WebhookSignatureHeader = "X-Turbo-Signature-256"
+	WebhookTimestampHeader = "X-Turbo-Timestamp"
 )
 
 // WebhookSignatureReason classifies a verification failure.
@@ -112,4 +124,47 @@ func VerifyWebhookSignature(
 		return &WebhookSignatureError{Reason: ReasonSignatureMismatch}
 	}
 	return nil
+}
+
+// VerifyWebhookRequest is the one-call wrapper around an inbound *http.Request:
+// read the body, pull the SOPHON signature + timestamp headers, verify the
+// HMAC, and unmarshal into a WebhookDeliveryPayload. The request body is
+// replaced with an io.NopCloser over the bytes that were verified so
+// downstream handlers can still ReadAll if they want.
+//
+//	func handle(w http.ResponseWriter, r *http.Request) {
+//	    payload, err := helpers.VerifyWebhookRequest(r, secret, helpers.VerifyWebhookSignatureOptions{})
+//	    if err != nil { http.Error(w, "unauthorized", 401); return }
+//	    // … use payload …
+//	}
+func VerifyWebhookRequest(
+	r *http.Request,
+	secret string,
+	opts VerifyWebhookSignatureOptions,
+) (*sophon.WebhookDeliveryPayload, error) {
+	if r == nil || r.Body == nil {
+		return nil, fmt.Errorf("sophon: nil http request")
+	}
+	body, err := io.ReadAll(r.Body)
+	_ = r.Body.Close()
+	if err != nil {
+		return nil, fmt.Errorf("sophon: read webhook body: %w", err)
+	}
+	r.Body = io.NopCloser(strings.NewReader(string(body)))
+
+	if err := VerifyWebhookSignature(
+		body,
+		r.Header.Get(WebhookSignatureHeader),
+		r.Header.Get(WebhookTimestampHeader),
+		secret,
+		opts,
+	); err != nil {
+		return nil, err
+	}
+
+	var payload sophon.WebhookDeliveryPayload
+	if err := json.Unmarshal(body, &payload); err != nil {
+		return nil, fmt.Errorf("sophon: decode webhook payload: %w", err)
+	}
+	return &payload, nil
 }

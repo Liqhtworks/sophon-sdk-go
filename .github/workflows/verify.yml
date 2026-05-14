@@ -32,3 +32,22 @@ jobs:
       - run: go test ./...
       - run: go build ./...
       - run: go vet ./...
+      - name: Adapter splice present
+        # helpers/adapters.go.tmpl is renamed to adapters.go upstream in
+        # sophon-api during publish. If the rename fails, the helpers
+        # package still compiles but consumers hit "undefined:
+        # helpers.NewUploadsClient" with no actionable error. Catch that
+        # here, in the SDK repo, where the consumer actually pulls from.
+        run: |
+          if ! grep -q "func NewUploadsClient" helpers/adapters.go; then
+            echo "::error::helpers/adapters.go is missing NewUploadsClient — adapter splice did not run"
+            exit 1
+          fi
+          if ! grep -q "func NewJobsClient" helpers/adapters.go; then
+            echo "::error::helpers/adapters.go is missing NewJobsClient — adapter splice did not run"
+            exit 1
+          fi
+          if ! grep -q "func NewDownloadsClient" helpers/adapters.go; then
+            echo "::error::helpers/adapters.go is missing NewDownloadsClient — adapter splice did not run"
+            exit 1
+          fi

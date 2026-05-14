@@ -12,7 +12,7 @@ Official Go SDK for the [SOPHON Encoding API](https://sophon.rs).
 go get github.com/Liqhtworks/sophon-sdk-go@latest
 ```
 
-Requires Go 1.22+.
+Requires Go 1.23+.
 
 ## Get an API key
 
@@ -45,9 +45,6 @@ package main
 import (
     "context"
     "fmt"
-    "io"
-    "net/http"
-    "net/url"
     "os"
     "path/filepath"
     "strings"
@@ -55,7 +52,6 @@ import (
 
     sophon "github.com/Liqhtworks/sophon-sdk-go"
     "github.com/Liqhtworks/sophon-sdk-go/helpers"
-    "github.com/google/uuid"
 )
 
 func main() {
@@ -79,8 +75,9 @@ func main() {
 
     ctx := context.Background()
 
-    uploads := helpers.NewUploadsClient(client.UploadsAPI)
-    jobs    := helpers.NewJobsClient(client.JobsAPI)
+    uploads   := helpers.NewUploadsClient(client.UploadsAPI)
+    jobs      := helpers.NewJobsClient(client.JobsAPI)
+    downloads := helpers.NewDownloadsClient(client)
 
     // 1. Upload a file (chunked, concurrent, resumable).
     reader, size, closer, err := helpers.OpenFileForUpload(inputPath)
@@ -103,79 +100,28 @@ func main() {
     if err != nil { panic(err) }
 
     // 2. Start an encode.
-    idempotencyKey := uuid.NewString()
-    job, _, err := client.JobsAPI.CreateJob(ctx).
-        IdempotencyKey(idempotencyKey).
-        CreateJobRequest(sophon.CreateJobRequest{
-            Source:  helpers.JobSource.Upload(upload.UploadID),
-            Profile: sophon.SOPHON_ESPRESSO,
-        }).
-        Execute()
+    job, err := helpers.CreateJob(ctx, jobs,
+        helpers.JobSource.Upload(upload.UploadID),
+        sophon.SOPHON_ESPRESSO,
+        helpers.CreateJobOptions{})
     if err != nil { panic(err) }
 
     // 3. Wait for it to finish.
-    final, err := helpers.WaitForJob(ctx, jobs, job.GetId(), helpers.WaitForJobOptions{
+    final, err := helpers.WaitForJob(ctx, jobs, job.ID, helpers.WaitForJobOptions{
         Timeout: 30 * time.Minute,
         OnProgress: func(j *helpers.Job) {
             fmt.Printf("job %s: %s\n", j.ID, j.Status)
         },
     })
     if err != nil { panic(err) }
-    if final.Status != "completed" { panic("job ended in " + final.Status) }
+    if final.Status != sophon.COMPLETED {
+        panic("job ended in " + string(final.Status))
+    }
 
     // 4. Download the encoded output.
-    if err := downloadOutput(baseURL, apiKey, final.ID, "sophon-output.mp4"); err != nil {
-        panic(err)
-    }
-    fmt.Println("wrote sophon-output.mp4")
-}
-
-func downloadOutput(baseURL, apiKey, jobID, outputPath string) error {
-    client := &http.Client{
-        CheckRedirect: func(*http.Request, []*http.Request) error {
-            return http.ErrUseLastResponse
-        },
-        Timeout: 30 * time.Second,
-    }
-
-    req, err := http.NewRequest("GET", baseURL+"/v1/jobs/"+jobID+"/output", nil)
-    if err != nil { return err }
-    req.Header.Set("Authorization", "Bearer "+apiKey)
-
-    res, err := client.Do(req)
-    if err != nil { return err }
-    defer res.Body.Close()
-    if res.StatusCode != http.StatusFound {
-        return fmt.Errorf("expected output redirect, got %d", res.StatusCode)
-    }
-
-    location := res.Header.Get("Location")
-    if location == "" { return fmt.Errorf("missing output redirect") }
-
-    downloadURL, err := resolveURL(baseURL, location)
-    if err != nil { return err }
-
-    dl, err := http.Get(downloadURL)
-    if err != nil { return err }
-    defer dl.Body.Close()
-    if dl.StatusCode < 200 || dl.StatusCode >= 300 {
-        return fmt.Errorf("download failed: %d", dl.StatusCode)
-    }
-
-    out, err := os.Create(outputPath)
-    if err != nil { return err }
-    defer out.Close()
-    _, err = io.Copy(out, dl.Body)
-    return err
-}
-
-func resolveURL(baseURL, location string) (string, error) {
-    loc, err := url.Parse(location)
-    if err != nil { return "", err }
-    if loc.IsAbs() { return loc.String(), nil }
-    base, err := url.Parse(baseURL)
-    if err != nil { return "", err }
-    return base.ResolveReference(loc).String(), nil
+    n, err := helpers.DownloadOutputToFile(ctx, downloads, final.ID, "sophon-output.mp4")
+    if err != nil { panic(err) }
+    fmt.Printf("wrote sophon-output.mp4 (%d bytes)\n", n)
 }
 ```
 
@@ -231,23 +177,55 @@ func handle(w http.ResponseWriter, r *http.Request) {
 
 | Function | What it does |
 |---|---|
-| `helpers.NewUploadsClient(client.UploadsAPI)` | Bridge generated `*UploadsAPIService` to `UploadsClient`. |
+| `helpers.NewUploadsClient(client.UploadsAPI)` | Bridge generated `*UploadsAPIService` to `UploadsClient`. Stages each chunk through `os.CreateTemp` (constrained by the OpenAPI generator's `*os.File` body type). |
+| `helpers.NewStreamingUploadsClient(client)` | Same surface as `NewUploadsClient` but streams part bodies directly from memory via `bytes.NewReader` — no tempfile per chunk. Preferred for large uploads / Windows. |
 | `helpers.NewJobsClient(client.JobsAPI)` | Bridge generated `*JobsAPIService` to `JobsClient`. |
-| `helpers.UploadFile(ctx, uploads, reader, size, name, mime, opts)` | Slice into chunks, upload with bounded concurrency, retry transient errors with jittered backoff, resume from a prior `UploadID`, report progress. |
+| `helpers.NewDownloadsClient(client)` | Bridge the SDK client to `DownloadsClient` for output downloads. |
+| `helpers.UploadFile(ctx, uploads, reader, size, name, mime, opts)` | Slice into chunks, upload with bounded concurrency, retry transient errors with jittered backoff, resume from a prior `UploadID`, report progress. `UploadFileOptions.PartTimeout` bounds each part attempt (default 60s); `Retries=0` is now honored literally (pass a negative value for the default 3). |
 | `helpers.OpenFileForUpload(path)` | Open a file path and return `(io.ReaderAt, size, closer, err)` ready for `UploadFile`. |
-| `helpers.WaitForJob(ctx, jobs, id, opts)` | Poll until terminal status (or a caller-specified set). Returns `*JobTerminalError` on `failed`/`canceled` (default set), `*JobTimeoutError` if the deadline elapses. |
-| `helpers.VerifyWebhookSignature(body, sig, ts, secret, opts)` | Constant-time HMAC verification + default 5-minute replay window. |
+| `helpers.CreateJob(ctx, jobs, source, profile, opts)` | One-call CreateJob wrapper; auto-generates an idempotency key and normalizes nil metadata to `{}`. |
+| `helpers.JobSource.Upload(uploadID)` | Typed constructor for `CreateJobRequest.Source` — wraps the oneOf so callers do not type the discriminator. |
+| `helpers.WaitForJob(ctx, jobs, id, opts)` | Poll until terminal status (or a caller-specified set). Returns `*JobTerminalError` on `failed`/`canceled` (default set), `*JobTimeoutError` if the deadline elapses. Short `Timeout` values are now bounded by the timeout deadline, not the poll interval. |
+| `helpers.DownloadOutput(ctx, downloads, jobID, w)` | Follow the `/v1/jobs/{id}/output` 302, GET the presigned URL, stream into `w`. Returns bytes written. |
+| `helpers.DownloadOutputToFile(ctx, downloads, jobID, path)` | Convenience wrapper that creates `path` and streams the output into it. |
+| `helpers.VerifyWebhookSignature(body, sig, ts, secret, opts)` | Constant-time HMAC verification + default 5-minute replay window (raw-bytes primitive). |
+| `helpers.VerifyWebhookRequest(r, secret, opts)` | One-call `net/http` wrapper: reads the body, pulls the signature headers, verifies, decodes into `*sophon.WebhookDeliveryPayload`. |
+
+### Typed errors
+
+All helper-layer calls (`UploadFile`, `CreateJob`, `WaitForJob`,
+`DownloadOutput`, …) return typed errors so callers can branch with
+`errors.As` instead of parsing `*sophon.GenericOpenAPIError.Body()`:
+
+| Type | Surfaces | Notes |
+|---|---|---|
+| `*helpers.AuthenticationError` | HTTP 401 | bad / missing API key |
+| `*helpers.PermissionError` | HTTP 403 | key lacks permission |
+| `*helpers.NotFoundError` | HTTP 404 | unknown upload / job id |
+| `*helpers.ConflictError` | HTTP 409 | idempotency replay with a different body |
+| `*helpers.RateLimitError` | HTTP 429 | `.RetryAfter` parsed from `Retry-After` |
+| `*helpers.ServerError` | HTTP 5xx | retryable in `UploadFile`'s retry loop |
+| `*helpers.NetworkError` | transport failure | retryable (treated as status=0) |
+
+Each type embeds `*helpers.APIError` which exposes `.HTTPStatus()`,
+`.Body()` (raw response bytes), and `.Unwrap()` to the underlying
+`*sophon.GenericOpenAPIError`.
 
 ## Examples
 
 - [`examples/encode-file`](./examples/encode-file) - upload a local video,
   create an encode job, wait for completion, and download the MP4 output.
+- [`examples/upload-from-reader`](./examples/upload-from-reader) - stream
+  a buffered source through `NewStreamingUploadsClient` (no tempfile per
+  chunk).
+- [`examples/resume-upload`](./examples/resume-upload) - finish an upload
+  that crashed mid-flight by replaying with `UploadFileOptions.UploadID`.
 - [`examples/webhook-server`](./examples/webhook-server) - `net/http`
   endpoint that verifies raw request bytes before JSON parsing.
 
 ## Runtime support
 
-- Go 1.22+
+- Go 1.23+
 
 ## Versioning
 

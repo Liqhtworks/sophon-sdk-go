@@ -6,25 +6,36 @@ import (
 	"fmt"
 	"math"
 	"time"
+
+	sophon "github.com/Liqhtworks/sophon-sdk-go"
+	"github.com/google/uuid"
 )
 
 // Job is the subset of the generated JobResponse the helper needs.
 type Job struct {
 	ID     string
-	Status string
+	Status sophon.JobStatus
 	Error  string
 }
 
-// JobsClient is the transport surface the job waiter requires.
+// JobsClient is the transport surface the job waiter and creator require.
 type JobsClient interface {
 	GetJob(ctx context.Context, id string) (*Job, error)
+	CreateJob(
+		ctx context.Context,
+		source sophon.UploadJobSource,
+		profile sophon.JobProfile,
+		idempotencyKey string,
+		output *sophon.CreateJobOutputOptions,
+		metadata map[string]interface{},
+	) (*Job, error)
 }
 
 // TerminalStatuses is the set of job statuses that stop polling by default.
-var TerminalStatuses = map[string]struct{}{
-	"completed": {},
-	"failed":    {},
-	"canceled":  {},
+var TerminalStatuses = map[sophon.JobStatus]struct{}{
+	sophon.COMPLETED: {},
+	sophon.FAILED:    {},
+	sophon.CANCELED:  {},
 }
 
 // JobTerminalError is returned when a job ends in failed/canceled and the
@@ -54,7 +65,7 @@ func (e *JobTimeoutError) Error() string {
 type WaitForJobOptions struct {
 	// Poll until the job reaches any of these statuses. Defaults to the
 	// three terminal statuses (completed, failed, canceled).
-	Until []string
+	Until []sophon.JobStatus
 	// Initial poll interval. Default 1s.
 	PollMin time.Duration
 	// Cap on poll interval. Default 15s.
@@ -76,7 +87,7 @@ func WaitForJob(ctx context.Context, api JobsClient, jobID string, opts WaitForJ
 	customUntil := false
 	if len(opts.Until) > 0 {
 		customUntil = true
-		waitSet = make(map[string]struct{}, len(opts.Until))
+		waitSet = make(map[sophon.JobStatus]struct{}, len(opts.Until))
 		for _, s := range opts.Until {
 			waitSet[s] = struct{}{}
 		}
@@ -100,6 +111,7 @@ func WaitForJob(ctx context.Context, api JobsClient, jobID string, opts WaitForJ
 	}
 
 	start := time.Now()
+	deadline := start.Add(timeout)
 	interval := pollMin
 
 	for {
@@ -120,16 +132,25 @@ func WaitForJob(ctx context.Context, api JobsClient, jobID string, opts WaitForJ
 		}
 
 		if _, match := waitSet[job.Status]; match {
-			if !customUntil && (job.Status == "failed" || job.Status == "canceled") {
+			if !customUntil && (job.Status == sophon.FAILED || job.Status == sophon.CANCELED) {
 				return nil, &JobTerminalError{Job: job}
 			}
 			return job, nil
 		}
 
+		// Bound the sleep on the timeout deadline so a short Timeout does
+		// not get overrun by up to one full poll interval.
+		sleep := interval
+		if remaining := time.Until(deadline); remaining < sleep {
+			if remaining <= 0 {
+				return nil, &JobTimeoutError{JobID: jobID, WaitedMs: time.Since(start).Milliseconds()}
+			}
+			sleep = remaining
+		}
 		select {
 		case <-ctx.Done():
 			return nil, ctx.Err()
-		case <-time.After(interval):
+		case <-time.After(sleep):
 		}
 		next := time.Duration(math.Ceil(float64(interval) * backoff))
 		if next > pollMax {
@@ -137,6 +158,43 @@ func WaitForJob(ctx context.Context, api JobsClient, jobID string, opts WaitForJ
 		}
 		interval = next
 	}
+}
+
+// CreateJobOptions tunes CreateJob. Zero values mean "use the default".
+type CreateJobOptions struct {
+	// Auto-generated when empty.
+	IdempotencyKey string
+	// Optional output settings (container, etc).
+	Output *sophon.CreateJobOutputOptions
+	// Optional metadata. Normalized to {} when nil so the request body is
+	// always a valid map.
+	Metadata map[string]interface{}
+}
+
+// CreateJob is the one-call wrapper around the generated CreateJob builder.
+// It auto-generates an idempotency key when none is supplied and normalizes
+// nil metadata to an empty map, matching the Python helper.
+//
+//	job, err := helpers.CreateJob(ctx, jobs,
+//	    helpers.JobSource.Upload(upload.UploadID),
+//	    sophon.SOPHON_AUTO,
+//	    helpers.CreateJobOptions{})
+func CreateJob(
+	ctx context.Context,
+	api JobsClient,
+	source sophon.UploadJobSource,
+	profile sophon.JobProfile,
+	opts CreateJobOptions,
+) (*Job, error) {
+	idem := opts.IdempotencyKey
+	if idem == "" {
+		idem = "idem-" + uuid.NewString()
+	}
+	meta := opts.Metadata
+	if meta == nil {
+		meta = map[string]interface{}{}
+	}
+	return api.CreateJob(ctx, source, profile, idem, opts.Output, meta)
 }
 
 // Compile-time proof that our error types implement `error`.
