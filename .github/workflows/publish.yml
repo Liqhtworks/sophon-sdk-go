@@ -1,0 +1,100 @@
+name: Publish
+
+# Go modules publish via tag push — proxy.golang.org reads the tag directly.
+# This workflow does not push to a registry. It validates that the tag matches
+# VERSION + CHANGELOG, runs the full test/build/vet matrix, and warms the
+# module proxy so `go get @vX.Y.Z` resolves immediately after the tag lands.
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Version to validate (without leading v)"
+        required: true
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    name: Validate tag + VERSION + CHANGELOG
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.23"
+
+      - name: Resolve target version
+        id: ver
+        run: |
+          if [ -n "${{ github.event.inputs.version }}" ]; then
+            echo "version=${{ github.event.inputs.version }}" >> "$GITHUB_OUTPUT"
+          else
+            tag="${GITHUB_REF##refs/tags/}"
+            echo "version=${tag#v}" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: VERSION file matches tag
+        run: |
+          want="${{ steps.ver.outputs.version }}"
+          got="$(tr -d '[:space:]' < VERSION)"
+          if [ "$want" != "$got" ]; then
+            echo "::error::VERSION file ($got) does not match tag ($want)"
+            exit 1
+          fi
+
+      - name: sophon.Version constant matches tag
+        run: |
+          want="${{ steps.ver.outputs.version }}"
+          if ! grep -q "Version = \"$want\"" version.go; then
+            echo "::error::version.go does not declare Version = \"$want\""
+            exit 1
+          fi
+
+      - name: CHANGELOG mentions tag
+        run: |
+          want="${{ steps.ver.outputs.version }}"
+          if ! grep -qE "^##? +\[?v?$want\]?(\b|$)" CHANGELOG.md; then
+            echo "::error::CHANGELOG.md is missing an entry for v$want"
+            exit 1
+          fi
+
+      - name: Tests
+        run: go test ./...
+
+      - name: Build
+        run: go build ./...
+
+      - name: Vet
+        run: go vet ./...
+
+  warm-proxy:
+    name: Warm proxy.golang.org cache
+    needs: validate
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    steps:
+      - name: Resolve version
+        id: ver
+        run: |
+          tag="${GITHUB_REF##refs/tags/}"
+          echo "version=${tag#v}" >> "$GITHUB_OUTPUT"
+
+      - name: Request module from proxy
+        env:
+          GOPROXY: https://proxy.golang.org
+        run: |
+          for i in 1 2 3 4 5 6; do
+            if curl -fsSL \
+              "https://proxy.golang.org/github.com/!liqhtworks/sophon-sdk-go/@v/v${{ steps.ver.outputs.version }}.info"; then
+              echo "warmed"
+              exit 0
+            fi
+            echo "proxy not ready yet, retrying in 30s..."
+            sleep 30
+          done
+          echo "::warning::proxy did not respond after retries — go get may still work"
